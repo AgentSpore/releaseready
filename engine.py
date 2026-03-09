@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 from datetime import datetime, timezone
+from collections import Counter
 
 import aiosqlite
 
@@ -120,15 +121,12 @@ async def create_checklist(db: aiosqlite.Connection, data: dict) -> dict:
          data.get("owner_email"), data.get("description"), now)
     )
     checklist_id = cur.lastrowid
-
-    # Seed default checks
     for category, title, is_blocking in DEFAULT_CHECKS:
         await db.execute(
             "INSERT INTO check_items (checklist_id, category, title, is_blocking) VALUES (?, ?, ?, ?)",
             (checklist_id, category, title, int(is_blocking))
         )
     await db.commit()
-
     rows = await db.execute_fetchall("SELECT * FROM checklists WHERE id = ?", (checklist_id,))
     stats = await _compute_stats(db, checklist_id)
     return _checklist_row(rows[0], stats)
@@ -193,7 +191,7 @@ async def add_check_item(db: aiosqlite.Connection, data: dict) -> dict:
 
 async def create_rollback_plan(db: aiosqlite.Connection, data: dict) -> dict:
     now = datetime.now(timezone.utc).isoformat()
-    cur = await db.execute(
+    await db.execute(
         "INSERT OR REPLACE INTO rollback_plans (checklist_id, steps, estimated_minutes, contacts, created_at) VALUES (?, ?, ?, ?, ?)",
         (data["checklist_id"], json.dumps(data["steps"]),
          data.get("estimated_minutes", 15), json.dumps(data.get("contacts", [])), now)
@@ -211,8 +209,8 @@ async def get_readiness_report(db: aiosqlite.Connection, checklist_id: int) -> d
     if not checklist:
         return None
     items = await list_check_items(db, checklist_id)
-    blocking_failures = [_item_row_dict(i) for i in items
-                         if i["status"] == "fail" and i["is_blocking"]]
+    blocking_failures = [{"id": i["id"], "title": i["title"], "category": i["category"]}
+                         for i in items if i["status"] == "fail" and i["is_blocking"]]
     rollback_rows = await db.execute_fetchall(
         "SELECT * FROM rollback_plans WHERE checklist_id = ?", (checklist_id,))
     has_rollback = len(rollback_rows) > 0
@@ -253,5 +251,40 @@ async def get_readiness_report(db: aiosqlite.Connection, checklist_id: int) -> d
     }
 
 
-def _item_row_dict(item: dict) -> dict:
-    return {"id": item["id"], "title": item["title"], "category": item["category"]}
+async def get_aggregate_stats(db: aiosqlite.Connection) -> dict:
+    """Aggregate stats across all release checklists for engineering manager dashboards."""
+    cl_rows = await db.execute_fetchall("SELECT * FROM checklists ORDER BY created_at DESC")
+    total = len(cl_rows)
+    if total == 0:
+        return {"total_releases": 0, "by_environment": {}, "by_status": {},
+                "avg_readiness_score": 0, "most_failed_checks": [], "services": []}
+
+    by_env: Counter = Counter(r["environment"] for r in cl_rows)
+    by_status: Counter = Counter(r["status"] for r in cl_rows)
+
+    scores = []
+    for r in cl_rows:
+        s = await _compute_stats(db, r["id"])
+        scores.append(s["score"])
+    avg_score = round(sum(scores) / len(scores), 1)
+
+    # Most frequently failed check titles (blocking only)
+    failed_rows = await db.execute_fetchall(
+        "SELECT title, COUNT(*) as cnt FROM check_items WHERE status='fail' AND is_blocking=1 GROUP BY title ORDER BY cnt DESC LIMIT 5"
+    )
+    most_failed = [{"title": r["title"], "fail_count": r["cnt"]} for r in failed_rows]
+
+    # Unique services + their last release date
+    svc_rows = await db.execute_fetchall(
+        "SELECT service, COUNT(*) as releases, MAX(created_at) as last_release FROM checklists GROUP BY service ORDER BY last_release DESC LIMIT 10"
+    )
+    services = [{"service": r["service"], "releases": r["releases"], "last_release": r["last_release"]} for r in svc_rows]
+
+    return {
+        "total_releases": total,
+        "by_environment": dict(by_env),
+        "by_status": dict(by_status),
+        "avg_readiness_score": avg_score,
+        "most_failed_checks": most_failed,
+        "services": services,
+    }
