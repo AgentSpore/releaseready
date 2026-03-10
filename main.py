@@ -9,12 +9,13 @@ from models import (
     ChecklistCreate, ChecklistResponse,
     CheckItemCreate, CheckItemResponse, CheckItemUpdate,
     RollbackPlanCreate, RollbackPlanResponse,
-    ReadinessReport,
+    ReadinessReport, BulkItemUpdate,
 )
 from engine import (
     init_db, create_checklist, list_checklists, get_checklist,
     list_check_items, update_check_item, add_check_item,
     create_rollback_plan, get_readiness_report, get_aggregate_stats,
+    clone_checklist, bulk_update_items,
 )
 
 DB_PATH = os.getenv("DB_PATH", "releaseready.db")
@@ -30,7 +31,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="ReleaseReady",
     description="Production release readiness checklist. Pre-flight checks, rollback playbooks, deployment gates.",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -38,27 +39,18 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.2.0"}
+    return {"status": "ok", "version": "0.3.0"}
 
 
 # ── Checklists ────────────────────────────────────────────────────────────
 
 @app.post("/checklists", response_model=ChecklistResponse, status_code=201)
 async def create(body: ChecklistCreate):
-    """
-    Create a release checklist. Auto-seeds 15 default checks across
-    infra, code, data, security, comms, and rollback categories.
-    """
     return await create_checklist(app.state.db, body.model_dump())
 
 
 @app.get("/checklists/stats")
 async def aggregate_stats():
-    """
-    Aggregate stats across all releases: total count, breakdown by environment
-    and status, average readiness score, most frequently failed blocking checks,
-    and top services by release frequency.
-    """
     return await get_aggregate_stats(app.state.db)
 
 
@@ -67,7 +59,6 @@ async def list_all(
     environment: str | None = Query(None, description="staging | production | canary"),
     status: str | None = Query(None, description="in_progress | ready | blocked | completed"),
 ):
-    """List release checklists with readiness scores."""
     return await list_checklists(app.state.db, environment, status)
 
 
@@ -77,6 +68,19 @@ async def get_one(checklist_id: int):
     if not c:
         raise HTTPException(404, "Checklist not found")
     return c
+
+
+@app.post("/checklists/{checklist_id}/clone", response_model=ChecklistResponse, status_code=201)
+async def clone(
+    checklist_id: int,
+    new_version: str = Query(..., description="Version string for the cloned checklist, e.g. v2.4.0"),
+    new_name: str | None = Query(None, description="Optional name override for the clone"),
+):
+    """Clone a checklist with all items reset to pending — ideal for recurring service releases."""
+    result = await clone_checklist(app.state.db, checklist_id, new_version, new_name)
+    if not result:
+        raise HTTPException(404, "Checklist not found")
+    return result
 
 
 # ── Check Items ───────────────────────────────────────────────────────────
@@ -96,6 +100,18 @@ async def add_item(checklist_id: int, body: CheckItemCreate):
         raise HTTPException(404, "Checklist not found")
     body.checklist_id = checklist_id
     return await add_check_item(app.state.db, body.model_dump())
+
+
+@app.patch("/checklists/{checklist_id}/items/bulk")
+async def bulk_update(checklist_id: int, body: BulkItemUpdate):
+    """Update multiple check items at once — useful for CI/CD pipelines auto-passing infra checks."""
+    c = await get_checklist(app.state.db, checklist_id)
+    if not c:
+        raise HTTPException(404, "Checklist not found")
+    return await bulk_update_items(
+        app.state.db, checklist_id,
+        [u.model_dump() for u in body.updates]
+    )
 
 
 @app.patch("/items/{item_id}", response_model=CheckItemResponse)
