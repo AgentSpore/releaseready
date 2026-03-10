@@ -252,7 +252,6 @@ async def get_readiness_report(db: aiosqlite.Connection, checklist_id: int) -> d
 
 
 async def get_aggregate_stats(db: aiosqlite.Connection) -> dict:
-    """Aggregate stats across all release checklists for engineering manager dashboards."""
     cl_rows = await db.execute_fetchall("SELECT * FROM checklists ORDER BY created_at DESC")
     total = len(cl_rows)
     if total == 0:
@@ -268,13 +267,11 @@ async def get_aggregate_stats(db: aiosqlite.Connection) -> dict:
         scores.append(s["score"])
     avg_score = round(sum(scores) / len(scores), 1)
 
-    # Most frequently failed check titles (blocking only)
     failed_rows = await db.execute_fetchall(
         "SELECT title, COUNT(*) as cnt FROM check_items WHERE status='fail' AND is_blocking=1 GROUP BY title ORDER BY cnt DESC LIMIT 5"
     )
     most_failed = [{"title": r["title"], "fail_count": r["cnt"]} for r in failed_rows]
 
-    # Unique services + their last release date
     svc_rows = await db.execute_fetchall(
         "SELECT service, COUNT(*) as releases, MAX(created_at) as last_release FROM checklists GROUP BY service ORDER BY last_release DESC LIMIT 10"
     )
@@ -288,3 +285,55 @@ async def get_aggregate_stats(db: aiosqlite.Connection) -> dict:
         "most_failed_checks": most_failed,
         "services": services,
     }
+
+
+async def clone_checklist(db: aiosqlite.Connection, checklist_id: int,
+                           new_version: str, new_name: str | None = None) -> dict | None:
+    src = await db.execute_fetchall("SELECT * FROM checklists WHERE id=?", (checklist_id,))
+    if not src:
+        return None
+    s = src[0]
+    now = datetime.now(timezone.utc).isoformat()
+    name = new_name or f"{s['name']} (clone)"
+    cur = await db.execute(
+        """INSERT INTO checklists (name, service, version, environment, owner_email, description, created_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        (name, s["service"], new_version, s["environment"], s["owner_email"], s["description"], now)
+    )
+    new_id = cur.lastrowid
+    src_items = await db.execute_fetchall(
+        "SELECT * FROM check_items WHERE checklist_id=? ORDER BY id", (checklist_id,)
+    )
+    for item in src_items:
+        await db.execute(
+            """INSERT INTO check_items (checklist_id, category, title, description, is_blocking, owner_email)
+               VALUES (?,?,?,?,?,?)""",
+            (new_id, item["category"], item["title"], item["description"],
+             item["is_blocking"], item["owner_email"])
+        )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM checklists WHERE id=?", (new_id,))
+    stats = await _compute_stats(db, new_id)
+    return _checklist_row(rows[0], stats)
+
+
+async def bulk_update_items(db: aiosqlite.Connection, checklist_id: int,
+                             updates: list[dict]) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    updated = []
+    not_found = []
+    for u in updates:
+        item_id = u["item_id"]
+        rows = await db.execute_fetchall(
+            "SELECT id FROM check_items WHERE id=? AND checklist_id=?", (item_id, checklist_id)
+        )
+        if not rows:
+            not_found.append(item_id)
+            continue
+        await db.execute(
+            "UPDATE check_items SET status=?, notes=?, checked_by=?, checked_at=? WHERE id=?",
+            (u["status"], u.get("notes"), u.get("checked_by"), now, item_id)
+        )
+        updated.append(item_id)
+    await db.commit()
+    return {"updated": len(updated), "not_found": not_found, "updated_ids": updated}
