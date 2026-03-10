@@ -89,3 +89,14 @@ class ReadinessReport(BaseModel):
     blocking_failures: list[dict]
     has_rollback_plan: bool
     recommendation: str
+
+
+class BulkItemUpdateItem(BaseModel):
+    item_id: int
+    status: str = Field(..., description="pass | fail | skip | na")
+    notes: Optional[str] = None
+    checked_by: Optional[str] = None
+
+
+class BulkItemUpdate(BaseModel):
+    updates: list[BulkItemUpdateItem] = Field(min_length=1, max_length=100)
