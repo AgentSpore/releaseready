@@ -43,6 +43,16 @@ CREATE TABLE IF NOT EXISTS rollback_plans (
     created_at TEXT NOT NULL,
     FOREIGN KEY (checklist_id) REFERENCES checklists(id)
 );
+
+CREATE TABLE IF NOT EXISTS sign_offs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    checklist_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL,
+    comment TEXT,
+    signed_at TEXT NOT NULL,
+    FOREIGN KEY (checklist_id) REFERENCES checklists(id)
+);
 """
 
 DEFAULT_CHECKS = [
@@ -84,7 +94,7 @@ def _checklist_row(r: aiosqlite.Row, stats: dict) -> dict:
         "failed_checks": stats.get("failed", 0),
         "blocked_checks": stats.get("blocking_failures", 0),
         "created_at": r["created_at"],
-        "completed_at": r.get("completed_at"),
+        "completed_at": r["completed_at"] if "completed_at" in r.keys() else None,
     }
 
 
@@ -96,6 +106,14 @@ def _item_row(r: aiosqlite.Row) -> dict:
         "is_blocking": bool(r["is_blocking"]),
         "owner_email": r["owner_email"], "notes": r["notes"],
         "checked_at": r["checked_at"], "checked_by": r["checked_by"],
+    }
+
+
+def _signoff_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"], "checklist_id": r["checklist_id"],
+        "name": r["name"], "role": r["role"],
+        "comment": r["comment"], "signed_at": r["signed_at"],
     }
 
 
@@ -159,6 +177,15 @@ async def get_checklist(db: aiosqlite.Connection, checklist_id: int) -> dict | N
     return _checklist_row(rows[0], stats)
 
 
+async def delete_checklist(db: aiosqlite.Connection, checklist_id: int) -> bool:
+    cur = await db.execute("DELETE FROM sign_offs WHERE checklist_id = ?", (checklist_id,))
+    await db.execute("DELETE FROM check_items WHERE checklist_id = ?", (checklist_id,))
+    await db.execute("DELETE FROM rollback_plans WHERE checklist_id = ?", (checklist_id,))
+    await db.execute("DELETE FROM checklists WHERE id = ?", (checklist_id,))
+    await db.commit()
+    return cur.rowcount >= 0
+
+
 async def list_check_items(db: aiosqlite.Connection, checklist_id: int) -> list[dict]:
     rows = await db.execute_fetchall(
         "SELECT * FROM check_items WHERE checklist_id = ? ORDER BY category, id", (checklist_id,))
@@ -204,6 +231,54 @@ async def create_rollback_plan(db: aiosqlite.Connection, data: dict) -> dict:
             "created_at": r["created_at"]}
 
 
+async def add_sign_off(db: aiosqlite.Connection, checklist_id: int, data: dict) -> dict | str | None:
+    cl = await db.execute_fetchall("SELECT * FROM checklists WHERE id = ?", (checklist_id,))
+    if not cl:
+        return None
+    if cl[0]["status"] == "completed":
+        return "already_completed"
+    stats = await _compute_stats(db, checklist_id)
+    if stats["blocking_failures"] > 0:
+        return "blocking_failures"
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        "INSERT INTO sign_offs (checklist_id, name, role, comment, signed_at) VALUES (?,?,?,?,?)",
+        (checklist_id, data["name"], data["role"], data.get("comment"), now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM sign_offs WHERE id = ?", (cur.lastrowid,))
+    return _signoff_row(rows[0]) if rows else None
+
+
+async def list_sign_offs(db: aiosqlite.Connection, checklist_id: int) -> list[dict]:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM sign_offs WHERE checklist_id = ? ORDER BY signed_at ASC",
+        (checklist_id,),
+    )
+    return [_signoff_row(r) for r in rows]
+
+
+async def complete_checklist(db: aiosqlite.Connection, checklist_id: int) -> dict | str | None:
+    cl = await db.execute_fetchall("SELECT * FROM checklists WHERE id = ?", (checklist_id,))
+    if not cl:
+        return None
+    if cl[0]["status"] == "completed":
+        return "already_completed"
+    sign_offs = await list_sign_offs(db, checklist_id)
+    if not sign_offs:
+        return "no_sign_offs"
+    stats = await _compute_stats(db, checklist_id)
+    if stats["blocking_failures"] > 0:
+        return "blocking_failures"
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        "UPDATE checklists SET status='completed', completed_at=? WHERE id=?",
+        (now, checklist_id),
+    )
+    await db.commit()
+    return await get_checklist(db, checklist_id)
+
+
 async def get_readiness_report(db: aiosqlite.Connection, checklist_id: int) -> dict | None:
     checklist = await get_checklist(db, checklist_id)
     if not checklist:
@@ -214,6 +289,7 @@ async def get_readiness_report(db: aiosqlite.Connection, checklist_id: int) -> d
     rollback_rows = await db.execute_fetchall(
         "SELECT * FROM rollback_plans WHERE checklist_id = ?", (checklist_id,))
     has_rollback = len(rollback_rows) > 0
+    sign_offs = await list_sign_offs(db, checklist_id)
     score = checklist["readiness_score"]
     failed = checklist["failed_checks"]
     blocking = len(blocking_failures)
@@ -224,9 +300,12 @@ async def get_readiness_report(db: aiosqlite.Connection, checklist_id: int) -> d
     elif failed > 0:
         recommendation = f"CAUTION — {failed} non-blocking check(s) failed. Proceed with care."
         status = "caution"
-    elif score >= 90 and has_rollback:
-        recommendation = "READY — all checks passed and rollback plan in place. Safe to deploy."
+    elif score >= 90 and has_rollback and sign_offs:
+        recommendation = "READY — all checks passed, rollback plan in place, signed off. Safe to deploy."
         status = "ready"
+    elif score >= 90 and has_rollback:
+        recommendation = "MOSTLY_READY — checks passed, rollback plan ready. Awaiting sign-off."
+        status = "mostly_ready"
     elif score >= 80:
         recommendation = "MOSTLY_READY — good score but add rollback plan before deploying."
         status = "mostly_ready"
@@ -247,6 +326,7 @@ async def get_readiness_report(db: aiosqlite.Connection, checklist_id: int) -> d
         "skipped": sum(1 for i in items if i["status"] in ("skip", "na")),
         "blocking_failures": blocking_failures,
         "has_rollback_plan": has_rollback,
+        "sign_off_count": len(sign_offs),
         "recommendation": recommendation,
     }
 

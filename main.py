@@ -10,12 +10,14 @@ from models import (
     CheckItemCreate, CheckItemResponse, CheckItemUpdate,
     RollbackPlanCreate, RollbackPlanResponse,
     ReadinessReport, BulkItemUpdate,
+    SignOffCreate, SignOffResponse,
 )
 from engine import (
-    init_db, create_checklist, list_checklists, get_checklist,
+    init_db, create_checklist, list_checklists, get_checklist, delete_checklist,
     list_check_items, update_check_item, add_check_item,
     create_rollback_plan, get_readiness_report, get_aggregate_stats,
     clone_checklist, bulk_update_items,
+    add_sign_off, list_sign_offs, complete_checklist,
 )
 
 DB_PATH = os.getenv("DB_PATH", "releaseready.db")
@@ -30,8 +32,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ReleaseReady",
-    description="Production release readiness checklist. Pre-flight checks, rollback playbooks, deployment gates.",
-    version="0.3.0",
+    description="Production release readiness checklist with sign-off workflow, rollback playbooks, and deployment gates.",
+    version="0.4.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -39,7 +41,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.3.0"}
+    return {"status": "ok", "version": "0.4.0"}
 
 
 # ── Checklists ────────────────────────────────────────────────────────────
@@ -70,16 +72,59 @@ async def get_one(checklist_id: int):
     return c
 
 
+@app.delete("/checklists/{checklist_id}", status_code=204)
+async def remove_checklist(checklist_id: int):
+    c = await get_checklist(app.state.db, checklist_id)
+    if not c:
+        raise HTTPException(404, "Checklist not found")
+    await delete_checklist(app.state.db, checklist_id)
+
+
 @app.post("/checklists/{checklist_id}/clone", response_model=ChecklistResponse, status_code=201)
 async def clone(
     checklist_id: int,
-    new_version: str = Query(..., description="Version string for the cloned checklist, e.g. v2.4.0"),
+    new_version: str = Query(..., description="Version string for the cloned checklist"),
     new_name: str | None = Query(None, description="Optional name override for the clone"),
 ):
-    """Clone a checklist with all items reset to pending — ideal for recurring service releases."""
     result = await clone_checklist(app.state.db, checklist_id, new_version, new_name)
     if not result:
         raise HTTPException(404, "Checklist not found")
+    return result
+
+
+# ── Sign-Off ──────────────────────────────────────────────────────────────
+
+@app.post("/checklists/{checklist_id}/sign-off", response_model=SignOffResponse, status_code=201)
+async def sign_off(checklist_id: int, body: SignOffCreate):
+    result = await add_sign_off(app.state.db, checklist_id, body.model_dump())
+    if result is None:
+        raise HTTPException(404, "Checklist not found")
+    if result == "already_completed":
+        raise HTTPException(409, "Checklist already completed")
+    if result == "blocking_failures":
+        raise HTTPException(422, "Cannot sign off: blocking check failures exist")
+    return result
+
+
+@app.get("/checklists/{checklist_id}/sign-offs", response_model=list[SignOffResponse])
+async def get_sign_offs(checklist_id: int):
+    c = await get_checklist(app.state.db, checklist_id)
+    if not c:
+        raise HTTPException(404, "Checklist not found")
+    return await list_sign_offs(app.state.db, checklist_id)
+
+
+@app.post("/checklists/{checklist_id}/complete", response_model=ChecklistResponse)
+async def complete(checklist_id: int):
+    result = await complete_checklist(app.state.db, checklist_id)
+    if result is None:
+        raise HTTPException(404, "Checklist not found")
+    if result == "already_completed":
+        raise HTTPException(409, "Checklist already completed")
+    if result == "no_sign_offs":
+        raise HTTPException(422, "Cannot complete: at least one sign-off is required")
+    if result == "blocking_failures":
+        raise HTTPException(422, "Cannot complete: blocking check failures exist")
     return result
 
 
@@ -104,7 +149,6 @@ async def add_item(checklist_id: int, body: CheckItemCreate):
 
 @app.patch("/checklists/{checklist_id}/items/bulk")
 async def bulk_update(checklist_id: int, body: BulkItemUpdate):
-    """Update multiple check items at once — useful for CI/CD pipelines auto-passing infra checks."""
     c = await get_checklist(app.state.db, checklist_id)
     if not c:
         raise HTTPException(404, "Checklist not found")
