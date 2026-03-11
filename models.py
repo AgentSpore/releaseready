@@ -88,6 +88,7 @@ class ReadinessReport(BaseModel):
     skipped: int
     blocking_failures: list[dict]
     has_rollback_plan: bool
+    sign_off_count: int
     recommendation: str
 
 
@@ -100,3 +101,18 @@ class BulkItemUpdateItem(BaseModel):
 
 class BulkItemUpdate(BaseModel):
     updates: list[BulkItemUpdateItem] = Field(min_length=1, max_length=100)
+
+
+class SignOffCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80, description="Approver name")
+    role: str = Field(min_length=1, max_length=80, description="Approver role, e.g. Engineering Lead")
+    comment: Optional[str] = Field(None, max_length=500)
+
+
+class SignOffResponse(BaseModel):
+    id: int
+    checklist_id: int
+    name: str
+    role: str
+    comment: Optional[str]
+    signed_at: str
