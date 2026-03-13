@@ -109,7 +109,36 @@ CREATE INDEX IF NOT EXISTS idx_comments_checklist ON checklist_comments(checklis
 CREATE INDEX IF NOT EXISTS idx_windows_env ON release_windows(environment);
 CREATE INDEX IF NOT EXISTS idx_assignments_checklist ON check_assignments(checklist_id);
 CREATE INDEX IF NOT EXISTS idx_assignments_assignee ON check_assignments(assignee_email);
+
+CREATE TABLE IF NOT EXISTS checklist_labels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    checklist_id INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (checklist_id) REFERENCES checklists(id) ON DELETE CASCADE,
+    UNIQUE(checklist_id, label)
+);
+
+CREATE INDEX IF NOT EXISTS idx_labels_checklist ON checklist_labels(checklist_id);
+CREATE INDEX IF NOT EXISTS idx_labels_label ON checklist_labels(label);
+
+CREATE TABLE IF NOT EXISTS checklist_watchers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    checklist_id INTEGER NOT NULL,
+    email TEXT NOT NULL,
+    name TEXT,
+    added_at TEXT NOT NULL,
+    FOREIGN KEY (checklist_id) REFERENCES checklists(id) ON DELETE CASCADE,
+    UNIQUE(checklist_id, email)
+);
+
+CREATE INDEX IF NOT EXISTS idx_watchers_checklist ON checklist_watchers(checklist_id);
 """
+
+VALID_LABELS = frozenset({
+    "critical", "hotfix", "minor", "major",
+    "security", "emergency", "regression", "planned",
+})
 
 DEFAULT_CHECKS = [
     ("infra",     "All infrastructure changes reviewed",       True),
@@ -143,7 +172,16 @@ async def init_db(path: str) -> aiosqlite.Connection:
     return db
 
 
-def _checklist_row(r: aiosqlite.Row, stats: dict, comment_count: int = 0) -> dict:
+async def _checklist_labels(db: aiosqlite.Connection, checklist_id: int) -> list[str]:
+    rows = await db.execute_fetchall(
+        "SELECT label FROM checklist_labels WHERE checklist_id = ? ORDER BY created_at ASC",
+        (checklist_id,),
+    )
+    return [r["label"] for r in rows]
+
+
+def _checklist_row(r: aiosqlite.Row, stats: dict, comment_count: int = 0,
+                   labels: list[str] | None = None) -> dict:
     return {
         "id": r["id"], "name": r["name"], "service": r["service"],
         "version": r["version"], "environment": r["environment"],
@@ -155,6 +193,7 @@ def _checklist_row(r: aiosqlite.Row, stats: dict, comment_count: int = 0) -> dic
         "failed_checks": stats.get("failed", 0),
         "blocked_checks": stats.get("blocking_failures", 0),
         "comment_count": comment_count,
+        "labels": labels if labels is not None else [],
         "created_at": r["created_at"],
         "completed_at": r["completed_at"] if "completed_at" in r.keys() else None,
     }
@@ -323,17 +362,24 @@ async def create_checklist(db: aiosqlite.Connection, data: dict) -> dict:
     rows = await db.execute_fetchall("SELECT * FROM checklists WHERE id = ?", (checklist_id,))
     stats = await _compute_stats(db, checklist_id)
     cc = await _comment_count(db, checklist_id)
-    return _checklist_row(rows[0], stats, cc)
+    lbs = await _checklist_labels(db, checklist_id)
+    return _checklist_row(rows[0], stats, cc, lbs)
 
 
 async def list_checklists(db: aiosqlite.Connection, environment: str | None = None,
-                           status: str | None = None) -> list[dict]:
+                           status: str | None = None,
+                           label: str | None = None) -> list[dict]:
     q, params = "SELECT * FROM checklists", []
     conds = []
     if environment:
         conds.append("environment = ?"); params.append(environment)
     if status:
         conds.append("status = ?"); params.append(status)
+    if label:
+        conds.append(
+            "id IN (SELECT checklist_id FROM checklist_labels WHERE label = ?)"
+        )
+        params.append(label)
     if conds:
         q += " WHERE " + " AND ".join(conds)
     q += " ORDER BY created_at DESC"
@@ -342,7 +388,8 @@ async def list_checklists(db: aiosqlite.Connection, environment: str | None = No
     for r in rows:
         stats = await _compute_stats(db, r["id"])
         cc = await _comment_count(db, r["id"])
-        result.append(_checklist_row(r, stats, cc))
+        lbs = await _checklist_labels(db, r["id"])
+        result.append(_checklist_row(r, stats, cc, lbs))
     return result
 
 
@@ -352,7 +399,8 @@ async def get_checklist(db: aiosqlite.Connection, checklist_id: int) -> dict | N
         return None
     stats = await _compute_stats(db, checklist_id)
     cc = await _comment_count(db, checklist_id)
-    return _checklist_row(rows[0], stats, cc)
+    lbs = await _checklist_labels(db, checklist_id)
+    return _checklist_row(rows[0], stats, cc, lbs)
 
 
 async def delete_checklist(db: aiosqlite.Connection, checklist_id: int) -> bool:
@@ -361,6 +409,8 @@ async def delete_checklist(db: aiosqlite.Connection, checklist_id: int) -> bool:
     await db.execute("DELETE FROM sign_offs WHERE checklist_id = ?", (checklist_id,))
     await db.execute("DELETE FROM check_items WHERE checklist_id = ?", (checklist_id,))
     await db.execute("DELETE FROM rollback_plans WHERE checklist_id = ?", (checklist_id,))
+    await db.execute("DELETE FROM checklist_labels WHERE checklist_id = ?", (checklist_id,))
+    await db.execute("DELETE FROM checklist_watchers WHERE checklist_id = ?", (checklist_id,))
     await db.execute("DELETE FROM checklists WHERE id = ?", (checklist_id,))
     await db.commit()
     return True
@@ -1135,3 +1185,259 @@ async def export_checklist_csv(db: aiosqlite.Connection, checklist_id: int) -> s
             so_writer.writerow({k: so.get(k, "") for k in so_fields})
 
     return buf.getvalue()
+
+
+# ── Release Labels (v0.9.0) ───────────────────────────────────────────────
+
+async def add_checklist_label(db: aiosqlite.Connection, checklist_id: int,
+                               label: str) -> dict | str | None:
+    """Add a label to a checklist. Returns dict on success, None if checklist not found,
+    'invalid_label' if label not in VALID_LABELS, 'duplicate' if already present."""
+    if label not in VALID_LABELS:
+        return "invalid_label"
+    cl = await db.execute_fetchall("SELECT id FROM checklists WHERE id = ?", (checklist_id,))
+    if not cl:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        cur = await db.execute(
+            "INSERT INTO checklist_labels (checklist_id, label, created_at) VALUES (?,?,?)",
+            (checklist_id, label, now),
+        )
+        await db.commit()
+    except Exception:
+        # UNIQUE constraint violation — label already present
+        return "duplicate"
+    rows = await db.execute_fetchall(
+        "SELECT * FROM checklist_labels WHERE id = ?", (cur.lastrowid,))
+    r = rows[0]
+    return {"id": r["id"], "checklist_id": r["checklist_id"],
+            "label": r["label"], "created_at": r["created_at"]}
+
+
+async def remove_checklist_label(db: aiosqlite.Connection, checklist_id: int,
+                                  label: str) -> bool:
+    cur = await db.execute(
+        "DELETE FROM checklist_labels WHERE checklist_id = ? AND label = ?",
+        (checklist_id, label),
+    )
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def list_checklist_labels(db: aiosqlite.Connection, checklist_id: int) -> list[dict]:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM checklist_labels WHERE checklist_id = ? ORDER BY created_at ASC",
+        (checklist_id,),
+    )
+    return [{"id": r["id"], "checklist_id": r["checklist_id"],
+             "label": r["label"], "created_at": r["created_at"]} for r in rows]
+
+
+async def list_checklists_by_label(db: aiosqlite.Connection, label: str,
+                                    limit: int = 50) -> list[dict]:
+    rows = await db.execute_fetchall(
+        """SELECT c.* FROM checklists c
+           JOIN checklist_labels lbl ON c.id = lbl.checklist_id
+           WHERE lbl.label = ?
+           ORDER BY c.created_at DESC
+           LIMIT ?""",
+        (label, limit),
+    )
+    result = []
+    for r in rows:
+        stats = await _compute_stats(db, r["id"])
+        cc = await _comment_count(db, r["id"])
+        lbs = await _checklist_labels(db, r["id"])
+        result.append(_checklist_row(r, stats, cc, lbs))
+    return result
+
+
+# ── Checklist Watchers (v0.9.0) ───────────────────────────────────────────
+
+async def add_watcher(db: aiosqlite.Connection, checklist_id: int,
+                      email: str, name: str | None = None) -> dict | str | None:
+    """Subscribe an email to a checklist. Returns dict, None if checklist not found,
+    or 'duplicate' if already watching."""
+    cl = await db.execute_fetchall("SELECT id FROM checklists WHERE id = ?", (checklist_id,))
+    if not cl:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        cur = await db.execute(
+            "INSERT INTO checklist_watchers (checklist_id, email, name, added_at) VALUES (?,?,?,?)",
+            (checklist_id, email, name, now),
+        )
+        await db.commit()
+    except Exception:
+        return "duplicate"
+    rows = await db.execute_fetchall(
+        "SELECT * FROM checklist_watchers WHERE id = ?", (cur.lastrowid,))
+    return _watcher_row(rows[0])
+
+
+async def list_watchers(db: aiosqlite.Connection, checklist_id: int) -> list[dict]:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM checklist_watchers WHERE checklist_id = ? ORDER BY added_at ASC",
+        (checklist_id,),
+    )
+    return [_watcher_row(r) for r in rows]
+
+
+async def remove_watcher(db: aiosqlite.Connection, watcher_id: int) -> bool:
+    cur = await db.execute("DELETE FROM checklist_watchers WHERE id = ?", (watcher_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def get_watcher_checklists(db: aiosqlite.Connection, email: str) -> list[dict]:
+    """Return all checklists watched by the given email."""
+    rows = await db.execute_fetchall(
+        """SELECT c.* FROM checklists c
+           JOIN checklist_watchers w ON c.id = w.checklist_id
+           WHERE w.email = ?
+           ORDER BY c.created_at DESC""",
+        (email,),
+    )
+    result = []
+    for r in rows:
+        stats = await _compute_stats(db, r["id"])
+        cc = await _comment_count(db, r["id"])
+        lbs = await _checklist_labels(db, r["id"])
+        result.append(_checklist_row(r, stats, cc, lbs))
+    return result
+
+
+def _watcher_row(r) -> dict:
+    return {
+        "id": r["id"],
+        "checklist_id": r["checklist_id"],
+        "email": r["email"],
+        "name": r["name"],
+        "added_at": r["added_at"],
+    }
+
+
+# ── Release Velocity Dashboard (v0.9.0) ───────────────────────────────────
+
+async def get_release_velocity(db: aiosqlite.Connection, days: int = 30) -> dict:
+    """Compute release velocity and bottleneck analytics for the given rolling period."""
+    cutoff = datetime.now(timezone.utc)
+    # Build ISO cutoff string for the period start
+    from datetime import timedelta
+    period_start = (cutoff - timedelta(days=days)).isoformat()
+
+    completed_rows = await db.execute_fetchall(
+        "SELECT * FROM checklists WHERE status = 'completed' AND completed_at >= ? ORDER BY completed_at ASC",
+        (period_start,),
+    )
+    total_releases = len(completed_rows)
+
+    # Compute per-release hours (created_at → completed_at)
+    def _hours(row) -> float | None:
+        try:
+            c = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
+            d = datetime.fromisoformat(row["completed_at"].replace("Z", "+00:00"))
+            return (d - c).total_seconds() / 3600.0
+        except Exception:
+            return None
+
+    all_hours = [h for row in completed_rows if (h := _hours(row)) is not None]
+    avg_completion_hours: float | None = (
+        round(sum(all_hours) / len(all_hours), 2) if all_hours else None
+    )
+    releases_per_week = round(total_releases / (days / 7), 2) if days > 0 else 0.0
+
+    # By service
+    svc_map: dict[str, list] = {}
+    for row in completed_rows:
+        svc_map.setdefault(row["service"], []).append(row)
+
+    by_service = []
+    for svc, rows in sorted(svc_map.items()):
+        h_list = [h for r in rows if (h := _hours(r)) is not None]
+        scores = []
+        for r in rows:
+            st = await _compute_stats(db, r["id"])
+            scores.append(st["score"])
+        by_service.append({
+            "service": svc,
+            "completed": len(rows),
+            "avg_hours": round(sum(h_list) / len(h_list), 2) if h_list else None,
+            "avg_score": round(sum(scores) / len(scores), 1) if scores else None,
+        })
+
+    # By environment
+    env_map: dict[str, list] = {}
+    for row in completed_rows:
+        env_map.setdefault(row["environment"], []).append(row)
+
+    by_environment = []
+    for env, rows in sorted(env_map.items()):
+        h_list = [h for r in rows if (h := _hours(r)) is not None]
+        by_environment.append({
+            "environment": env,
+            "completed": len(rows),
+            "avg_hours": round(sum(h_list) / len(h_list), 2) if h_list else None,
+        })
+
+    # Bottleneck categories — check items that failed within the period checklists
+    checklist_ids = [r["id"] for r in completed_rows]
+    bottleneck_categories: list[dict] = []
+    if checklist_ids:
+        placeholders = ",".join("?" * len(checklist_ids))
+        cat_rows = await db.execute_fetchall(
+            f"""SELECT category,
+                       COUNT(*) as total_checks,
+                       SUM(CASE WHEN status = 'fail' THEN 1 ELSE 0 END) as failed
+                FROM check_items
+                WHERE checklist_id IN ({placeholders})
+                GROUP BY category
+                ORDER BY failed DESC""",
+            checklist_ids,
+        )
+        for r in cat_rows:
+            total_c = r["total_checks"] or 0
+            failed_c = r["failed"] or 0
+            fail_rate = round(failed_c / total_c * 100, 1) if total_c > 0 else 0.0
+            bottleneck_categories.append({
+                "category": r["category"],
+                "total_checks": total_c,
+                "failed": failed_c,
+                "fail_rate_pct": fail_rate,
+            })
+        bottleneck_categories.sort(key=lambda x: x["fail_rate_pct"], reverse=True)
+
+    # Fastest and slowest releases
+    fastest_release: dict | None = None
+    slowest_release: dict | None = None
+    if all_hours:
+        paired = [
+            (h, row) for row, h in
+            [(r, _hours(r)) for r in completed_rows] if h is not None
+        ]
+        if paired:
+            fastest_row = min(paired, key=lambda x: x[0])
+            slowest_row = max(paired, key=lambda x: x[0])
+            fastest_release = {
+                "service": fastest_row[1]["service"],
+                "version": fastest_row[1]["version"],
+                "hours": round(fastest_row[0], 2),
+            }
+            slowest_release = {
+                "service": slowest_row[1]["service"],
+                "version": slowest_row[1]["version"],
+                "hours": round(slowest_row[0], 2),
+            }
+
+    return {
+        "period_days": days,
+        "total_releases": total_releases,
+        "avg_completion_hours": avg_completion_hours,
+        "releases_per_week": releases_per_week,
+        "by_service": by_service,
+        "by_environment": by_environment,
+        "bottleneck_categories": bottleneck_categories,
+        "fastest_release": fastest_release,
+        "slowest_release": slowest_release,
+    }

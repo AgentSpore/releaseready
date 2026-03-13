@@ -28,6 +28,7 @@ class ChecklistResponse(BaseModel):
     failed_checks: int
     blocked_checks: int
     comment_count: int
+    labels: list[str]
     created_at: str
     completed_at: Optional[str]
 
@@ -299,3 +300,73 @@ class ReleaseComparison(BaseModel):
     common_failures: list[str]
     unique_to_a: list[str]
     unique_to_b: list[str]
+
+
+# ── Release Labels (v0.9.0) ───────────────────────────────────────────────
+
+class LabelAddRequest(BaseModel):
+    label: str = Field(..., description=(
+        "Label: critical | hotfix | minor | major | security | emergency | regression | planned"
+    ))
+
+
+class LabelResponse(BaseModel):
+    id: int
+    checklist_id: int
+    label: str
+    created_at: str
+
+
+# ── Checklist Watchers (v0.9.0) ───────────────────────────────────────────
+
+class WatcherAddRequest(BaseModel):
+    email: str = Field(..., min_length=1, max_length=254, description="Watcher email address")
+    name: str | None = Field(None, max_length=120, description="Watcher display name")
+
+
+class WatcherResponse(BaseModel):
+    id: int
+    checklist_id: int
+    email: str
+    name: str | None
+    added_at: str
+
+
+# ── Release Velocity Dashboard (v0.9.0) ───────────────────────────────────
+
+class VelocityServiceEntry(BaseModel):
+    service: str
+    completed: int
+    avg_hours: float | None
+    avg_score: float | None
+
+
+class VelocityEnvironmentEntry(BaseModel):
+    environment: str
+    completed: int
+    avg_hours: float | None
+
+
+class BottleneckCategory(BaseModel):
+    category: str
+    total_checks: int
+    failed: int
+    fail_rate_pct: float
+
+
+class FastestSlowestRelease(BaseModel):
+    service: str
+    version: str
+    hours: float
+
+
+class ReleaseVelocity(BaseModel):
+    period_days: int
+    total_releases: int
+    avg_completion_hours: float | None
+    releases_per_week: float
+    by_service: list[VelocityServiceEntry]
+    by_environment: list[VelocityEnvironmentEntry]
+    bottleneck_categories: list[BottleneckCategory]
+    fastest_release: FastestSlowestRelease | None
+    slowest_release: FastestSlowestRelease | None
