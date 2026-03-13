@@ -10,6 +10,7 @@ class ChecklistCreate(BaseModel):
     environment: str = Field("production", description="Target environment: staging | production | canary")
     owner_email: Optional[str] = None
     description: Optional[str] = None
+    template_id: Optional[int] = Field(None, description="Create from template instead of default checks")
 
 
 class ChecklistResponse(BaseModel):
@@ -37,6 +38,7 @@ class CheckItemCreate(BaseModel):
     description: Optional[str] = None
     is_blocking: bool = Field(True, description="If True, failing this check blocks release")
     owner_email: Optional[str] = None
+    depends_on: Optional[int] = Field(None, description="ID of check item this depends on")
 
 
 class CheckItemResponse(BaseModel):
@@ -51,6 +53,7 @@ class CheckItemResponse(BaseModel):
     notes: Optional[str]
     checked_at: Optional[str]
     checked_by: Optional[str]
+    depends_on: Optional[int]
 
 
 class CheckItemUpdate(BaseModel):
@@ -116,3 +119,26 @@ class SignOffResponse(BaseModel):
     role: str
     comment: Optional[str]
     signed_at: str
+
+
+# ── Templates ─────────────────────────────────────────────────────────────
+
+class TemplateCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120, description="Template name")
+    description: Optional[str] = None
+    from_checklist_id: Optional[int] = Field(None, description="Copy checks from existing checklist")
+
+
+class TemplateResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    check_count: int
+    created_at: str
+
+
+class TemplateItemCreate(BaseModel):
+    category: str
+    title: str
+    description: Optional[str] = None
+    is_blocking: bool = True
