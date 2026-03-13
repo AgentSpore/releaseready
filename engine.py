@@ -576,3 +576,211 @@ async def bulk_update_items(db: aiosqlite.Connection, checklist_id: int,
     await db.commit()
     return {"updated": len(updated), "not_found": not_found, "updated_ids": updated,
             "dependency_blocked": dep_blocked}
+# Additional functions to append to releaseready engine.py for v0.6.0
+
+async def get_release_timeline(db: aiosqlite.Connection, checklist_id: int) -> dict | None:
+    """Get chronological timeline of all actions on a checklist."""
+    cl = await get_checklist(db, checklist_id)
+    if not cl:
+        return None
+    events = []
+    # Checklist creation
+    events.append({
+        "type": "checklist_created",
+        "timestamp": cl["created_at"],
+        "actor": cl.get("owner_email") or "system",
+        "detail": f"Created release checklist '{cl['name']}' for {cl['service']} {cl['version']}",
+    })
+    # Check item updates
+    items = await db.execute_fetchall(
+        "SELECT * FROM check_items WHERE checklist_id = ? AND checked_at IS NOT NULL ORDER BY checked_at ASC",
+        (checklist_id,),
+    )
+    for item in items:
+        events.append({
+            "type": f"check_{item['status']}",
+            "timestamp": item["checked_at"],
+            "actor": item["checked_by"] or "unknown",
+            "detail": f"[{item['category']}] {item['title']}: {item['status']}" + (f" — {item['notes']}" if item["notes"] else ""),
+        })
+    # Rollback plan
+    rp_rows = await db.execute_fetchall(
+        "SELECT * FROM rollback_plans WHERE checklist_id = ?", (checklist_id,))
+    for rp in rp_rows:
+        events.append({
+            "type": "rollback_plan_added",
+            "timestamp": rp["created_at"],
+            "actor": "system",
+            "detail": f"Rollback plan added ({rp['estimated_minutes']} min estimated)",
+        })
+    # Sign-offs
+    sign_offs = await db.execute_fetchall(
+        "SELECT * FROM sign_offs WHERE checklist_id = ? ORDER BY signed_at ASC",
+        (checklist_id,),
+    )
+    for so in sign_offs:
+        events.append({
+            "type": "sign_off",
+            "timestamp": so["signed_at"],
+            "actor": so["name"],
+            "detail": f"Signed off as {so['role']}" + (f": {so['comment']}" if so["comment"] else ""),
+        })
+    # Completion
+    if cl.get("completed_at"):
+        events.append({
+            "type": "checklist_completed",
+            "timestamp": cl["completed_at"],
+            "actor": "system",
+            "detail": f"Release marked as completed (score: {cl['readiness_score']}%)",
+        })
+    events.sort(key=lambda e: e["timestamp"])
+    return {
+        "checklist_id": checklist_id,
+        "service": cl["service"],
+        "version": cl["version"],
+        "total_events": len(events),
+        "events": events,
+    }
+
+
+async def get_service_releases(db: aiosqlite.Connection, service: str, limit: int = 20) -> dict:
+    """Get release history for a specific service."""
+    rows = await db.execute_fetchall(
+        "SELECT * FROM checklists WHERE service = ? ORDER BY created_at DESC LIMIT ?",
+        (service, limit),
+    )
+    releases = []
+    for r in rows:
+        stats = await _compute_stats(db, r["id"])
+        releases.append({
+            "id": r["id"],
+            "version": r["version"],
+            "environment": r["environment"],
+            "status": r["status"],
+            "readiness_score": stats["score"],
+            "total_checks": stats["total"],
+            "passed_checks": stats["passed"],
+            "blocking_failures": stats["blocking_failures"],
+            "created_at": r["created_at"],
+            "completed_at": r["completed_at"],
+        })
+    completed = [r for r in releases if r["status"] == "completed"]
+    avg_score = round(sum(r["readiness_score"] for r in completed) / len(completed), 1) if completed else 0
+    return {
+        "service": service,
+        "total_releases": len(releases),
+        "completed": len(completed),
+        "in_progress": sum(1 for r in releases if r["status"] == "in_progress"),
+        "avg_readiness_score": avg_score,
+        "releases": releases,
+    }
+
+
+async def get_risk_assessment(db: aiosqlite.Connection, checklist_id: int) -> dict | None:
+    """Automated risk scoring based on check failures, environment, history."""
+    cl = await get_checklist(db, checklist_id)
+    if not cl:
+        return None
+    stats = await _compute_stats(db, checklist_id)
+    items = await list_check_items(db, checklist_id)
+
+    risk_factors = []
+    risk_score = 0
+
+    # Factor 1: Blocking failures
+    if stats["blocking_failures"] > 0:
+        risk_score += 30
+        risk_factors.append({
+            "factor": "blocking_failures",
+            "severity": "critical",
+            "detail": f"{stats['blocking_failures']} blocking check(s) failed",
+            "impact": 30,
+        })
+
+    # Factor 2: Low readiness score
+    if stats["score"] < 80:
+        impact = min(25, (80 - stats["score"]))
+        risk_score += impact
+        risk_factors.append({
+            "factor": "low_readiness",
+            "severity": "high",
+            "detail": f"Readiness score {stats['score']}% (below 80% threshold)",
+            "impact": impact,
+        })
+
+    # Factor 3: Production environment
+    if cl["environment"] == "production":
+        risk_score += 10
+        risk_factors.append({
+            "factor": "production_environment",
+            "severity": "medium",
+            "detail": "Deploying to production increases risk",
+            "impact": 10,
+        })
+
+    # Factor 4: No rollback plan
+    rp = await db.execute_fetchall(
+        "SELECT id FROM rollback_plans WHERE checklist_id = ?", (checklist_id,))
+    if not rp:
+        risk_score += 15
+        risk_factors.append({
+            "factor": "no_rollback_plan",
+            "severity": "high",
+            "detail": "No rollback plan documented",
+            "impact": 15,
+        })
+
+    # Factor 5: No sign-offs
+    so = await list_sign_offs(db, checklist_id)
+    if not so:
+        risk_score += 10
+        risk_factors.append({
+            "factor": "no_sign_offs",
+            "severity": "medium",
+            "detail": "No approvals/sign-offs recorded",
+            "impact": 10,
+        })
+
+    # Factor 6: Pending checks
+    if stats["pending"] > 0:
+        impact = min(15, stats["pending"] * 3)
+        risk_score += impact
+        risk_factors.append({
+            "factor": "pending_checks",
+            "severity": "medium",
+            "detail": f"{stats['pending']} check(s) still pending",
+            "impact": impact,
+        })
+
+    # Factor 7: Security failures
+    security_fails = [i for i in items if i["category"] == "security" and i["status"] == "fail"]
+    if security_fails:
+        risk_score += 20
+        risk_factors.append({
+            "factor": "security_failures",
+            "severity": "critical",
+            "detail": f"{len(security_fails)} security check(s) failed",
+            "impact": 20,
+        })
+
+    risk_score = min(risk_score, 100)
+    if risk_score >= 60:
+        level = "critical"
+    elif risk_score >= 40:
+        level = "high"
+    elif risk_score >= 20:
+        level = "medium"
+    else:
+        level = "low"
+
+    return {
+        "checklist_id": checklist_id,
+        "service": cl["service"],
+        "version": cl["version"],
+        "environment": cl["environment"],
+        "risk_score": risk_score,
+        "risk_level": level,
+        "readiness_score": stats["score"],
+        "total_factors": len(risk_factors),
+        "factors": risk_factors,
+    }
