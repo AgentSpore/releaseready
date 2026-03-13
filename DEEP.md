@@ -1,50 +1,95 @@
 # ReleaseReady — Architecture (DEEP.md)
 
 ## Overview
-Production release readiness checklist service with templates, check dependencies, sign-off workflow, rollback playbooks, and deployment gates.
+Production release readiness checklist with templates, check dependencies,
+sign-off workflow, rollback playbooks, deployment gates, release timeline,
+service release cadence, and automated risk assessment.
 
-## Data Model
-- **checklists** — release metadata (name, service, version, environment, status)
-- **check_items** — individual checks with category, blocking flag, depends_on
-- **rollback_plans** — steps + contacts + estimated rollback time
-- **sign_offs** — approver name/role/comment
-- **templates** — reusable check templates
-- **template_items** — check definitions within a template
+## Stack
+- **Runtime**: Python 3.11+ / FastAPI / uvicorn
+- **Database**: aiosqlite (SQLite WAL mode, foreign keys ON)
+- **Models**: Pydantic v2 with Field validation
 
-## Workflow
-1. Create template (or use defaults) -> POST /templates
-2. Create checklist from template -> POST /checklists (template_id=N)
-3. Work through checks -> PATCH /items/{id} (respects dependencies)
-4. Add rollback plan -> POST /checklists/{id}/rollback
-5. Sign off -> POST /checklists/{id}/sign-off (blocked if blocking failures)
-6. Complete -> POST /checklists/{id}/complete (requires sign-off, no blocking failures)
-7. Get readiness report -> GET /checklists/{id}/report
+## Database Schema
 
-## Check Dependencies
-- `depends_on` field on check items points to another item ID
-- Cannot set status to "pass" if dependency item hasn't passed
-- Bulk update respects dependencies (skips blocked items, returns dep_blocked list)
-- Dependencies are intra-checklist only
+### templates / template_items
+Templates for reusable checklists. Items have category, title, description, blocking flag.
 
-## Templates
-- Created from scratch (seeds with DEFAULT_CHECKS) or from existing checklist
-- Template items: category, title, description, is_blocking
-- When creating checklist with template_id, copies template items instead of defaults
-- CRUD: create, list, get items, add item, delete
+### checklists
+| Column | Type | Notes |
+|--------|------|-------|
+| id | INTEGER PK | auto |
+| name | TEXT | release name |
+| service | TEXT | service/app name |
+| version | TEXT | semver |
+| environment | TEXT | staging/production/canary |
+| status | TEXT | in_progress/ready/blocked/completed |
+| readiness_score | REAL | 0-100 |
+| owner_email | TEXT NULL | release owner |
+| completed_at | TEXT NULL | ISO timestamp |
+| created_at | TEXT | ISO timestamp |
 
-## Readiness Report Statuses
-| Status | Condition |
-|--------|-----------|
-| BLOCKED | Any blocking check failed |
-| CAUTION | Non-blocking failures only |
-| READY | Score >= 90%, rollback plan, signed off |
-| MOSTLY_READY | Score >= 80-90% or missing rollback/sign-off |
-| NOT_READY | Score < 80% |
+### check_items
+Per-checklist checks with category, title, status (pending/pass/fail/skip),
+blocking flag, depends_on chain, checked_by, checked_at, notes.
 
-## Default Checks (15 items, 6 categories)
-infra (3), code (4), data (2), security (2), comms (2), rollback (2)
+### rollback_plans
+Steps, estimated_minutes, trigger_conditions per checklist.
 
-## Key Decisions
-- **Dependencies are soft**: only validated on "pass" status; "fail"/"skip" always allowed
-- **Templates don't carry dependencies**: dependencies are workflow-specific, set per-checklist
-- **Clone resets dependencies**: cloned items get depends_on=NULL to avoid cross-checklist refs
+### sign_offs
+Name, role, comment, signed_at per checklist.
+
+## API Endpoints (v0.6.0) — 22 endpoints
+
+### Templates
+- POST /templates — create (optionally from existing checklist)
+- GET /templates — list all
+- GET /templates/{id} — detail
+- GET /templates/{id}/items — template items
+- POST /templates/{id}/items — add item
+- DELETE /templates/{id} — remove
+
+### Checklists
+- POST /checklists — create (optionally from template)
+- GET /checklists — list (filter by environment, status)
+- GET /checklists/stats — aggregate statistics
+- GET /checklists/{id} — detail
+- DELETE /checklists/{id} — remove
+- POST /checklists/{id}/clone — clone with new version
+
+### Timeline & Risk
+- GET /checklists/{id}/timeline — chronological event log
+- GET /checklists/{id}/risk — automated risk assessment (7 factors)
+- GET /services/{name}/releases — release history with cadence metrics
+
+### Sign-Off & Completion
+- POST /checklists/{id}/sign-off — add approval
+- GET /checklists/{id}/sign-offs — list approvals
+- POST /checklists/{id}/complete — mark completed (requires sign-off)
+
+### Check Items
+- GET /checklists/{id}/items — list checks
+- POST /checklists/{id}/items — add check
+- PATCH /checklists/{id}/items/bulk — bulk update
+- PATCH /items/{id} — update single check
+
+### Rollback & Readiness
+- POST /checklists/{id}/rollback — add rollback plan
+- GET /checklists/{id}/report — readiness report
+
+## Key Features
+- **Release Timeline**: Chronological events (creation, checks, sign-offs, rollback plans, completion)
+- **Risk Assessment**: 7 factors (blocking failures, low readiness, production env, no rollback, no sign-offs, pending checks, security failures), scored 0-100 with level (low/medium/high/critical)
+- **Service Releases**: Release history per service with cadence metrics (avg score, completion rate)
+- **Templates**: Create from scratch or convert existing checklist
+- **Check Dependencies**: depends_on chain with circular reference detection
+- **Sign-Off Workflow**: Role-based approvals with blocking failure gate
+- **Readiness Score**: Auto-calculated from check results
+
+## Version History
+- v0.1.0: Basic checklists + check items
+- v0.2.0: Rollback plans, readiness reports
+- v0.3.0: Templates, clone, bulk update
+- v0.4.0: Sign-off workflow, completion gates
+- v0.5.0: Check dependencies, aggregate stats, env/status filters
+- v0.6.0: Release timeline, service cadence, risk assessment
