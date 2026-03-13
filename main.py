@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from models import (
     ChecklistCreate, ChecklistResponse,
@@ -13,6 +14,7 @@ from models import (
     SignOffCreate, SignOffResponse,
     TemplateCreate, TemplateResponse, TemplateItemCreate,
     ReleaseTimeline, ServiceReleases, RiskAssessment,
+    CommentCreate, CommentResponse, PromoteRequest,
 )
 from engine import (
     init_db, create_checklist, list_checklists, get_checklist, delete_checklist,
@@ -23,6 +25,8 @@ from engine import (
     create_template, list_templates, get_template, get_template_items,
     add_template_item, delete_template,
     get_release_timeline, get_service_releases, get_risk_assessment,
+    add_comment, list_comments, delete_comment,
+    promote_checklist, export_checklist_csv,
 )
 
 DB_PATH = os.getenv("DB_PATH", "releaseready.db")
@@ -40,9 +44,10 @@ app = FastAPI(
     description=(
         "Production release readiness checklist with templates, check dependencies, "
         "sign-off workflow, rollback playbooks, deployment gates, "
-        "release timeline, service release cadence, and automated risk assessment."
+        "release timeline, service release cadence, automated risk assessment, "
+        "checklist comments, environment promotion, and CSV export."
     ),
-    version="0.6.0",
+    version="0.7.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -50,7 +55,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.6.0"}
+    return {"status": "ok", "version": "0.7.0"}
 
 
 # ── Templates ─────────────────────────────────────────────────────────────
@@ -151,6 +156,37 @@ async def clone(
     return result
 
 
+# ── Environment Promotion ────────────────────────────────────────────────
+
+@app.post("/checklists/{checklist_id}/promote", response_model=ChecklistResponse, status_code=201)
+async def promote(checklist_id: int, body: PromoteRequest):
+    """Promote a checklist to a different environment (e.g. staging → production).
+    Passed checks carry over; failed/pending items reset to pending."""
+    result = await promote_checklist(
+        app.state.db, checklist_id,
+        body.target_environment, body.new_version, body.owner_email,
+    )
+    if result is None:
+        raise HTTPException(404, "Checklist not found")
+    if result == "same_environment":
+        raise HTTPException(422, "Target environment is the same as source")
+    return result
+
+
+# ── Checklist Export ─────────────────────────────────────────────────────
+
+@app.get("/checklists/{checklist_id}/export/csv")
+async def export_csv(checklist_id: int):
+    """Export checklist items and sign-offs as CSV for audit/compliance."""
+    data = await export_checklist_csv(app.state.db, checklist_id)
+    if data is None:
+        raise HTTPException(404, "Checklist not found")
+    return StreamingResponse(
+        iter([data]), media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=checklist_{checklist_id}.csv"},
+    )
+
+
 # ── Timeline ─────────────────────────────────────────────────────────────
 
 @app.get("/checklists/{checklist_id}/timeline", response_model=ReleaseTimeline)
@@ -171,6 +207,31 @@ async def risk_assessment(checklist_id: int):
     if not result:
         raise HTTPException(404, "Checklist not found")
     return result
+
+
+# ── Checklist Comments ───────────────────────────────────────────────────
+
+@app.post("/checklists/{checklist_id}/comments", response_model=CommentResponse, status_code=201)
+async def create_comment(checklist_id: int, body: CommentCreate):
+    """Add a discussion comment to a checklist."""
+    result = await add_comment(app.state.db, checklist_id, body.model_dump())
+    if result is None:
+        raise HTTPException(404, "Checklist not found")
+    return result
+
+
+@app.get("/checklists/{checklist_id}/comments", response_model=list[CommentResponse])
+async def get_comments(checklist_id: int):
+    c = await get_checklist(app.state.db, checklist_id)
+    if not c:
+        raise HTTPException(404, "Checklist not found")
+    return await list_comments(app.state.db, checklist_id)
+
+
+@app.delete("/comments/{comment_id}", status_code=204)
+async def remove_comment(comment_id: int):
+    if not await delete_comment(app.state.db, comment_id):
+        raise HTTPException(404, "Comment not found")
 
 
 # ── Sign-Off ──────────────────────────────────────────────────────────────
