@@ -133,11 +133,87 @@ CREATE TABLE IF NOT EXISTS checklist_watchers (
 );
 
 CREATE INDEX IF NOT EXISTS idx_watchers_checklist ON checklist_watchers(checklist_id);
+
+-- v1.0.0: Approval Gates
+CREATE TABLE IF NOT EXISTS approval_gates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    checklist_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    required_roles TEXT NOT NULL DEFAULT '[]',
+    min_approvals INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (checklist_id) REFERENCES checklists(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS gate_approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    gate_id INTEGER NOT NULL,
+    approver_email TEXT NOT NULL,
+    approver_role TEXT NOT NULL,
+    decision TEXT NOT NULL DEFAULT 'approved',
+    comment TEXT,
+    decided_at TEXT NOT NULL,
+    FOREIGN KEY (gate_id) REFERENCES approval_gates(id) ON DELETE CASCADE,
+    UNIQUE(gate_id, approver_email)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gates_checklist ON approval_gates(checklist_id);
+CREATE INDEX IF NOT EXISTS idx_gate_approvals_gate ON gate_approvals(gate_id);
+
+-- v1.0.0: Automation Rules
+CREATE TABLE IF NOT EXISTS automation_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    checklist_id INTEGER NOT NULL,
+    item_id INTEGER NOT NULL,
+    rule_type TEXT NOT NULL,
+    condition TEXT NOT NULL DEFAULT '{}',
+    is_enabled INTEGER NOT NULL DEFAULT 1,
+    times_fired INTEGER NOT NULL DEFAULT 0,
+    last_fired_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (checklist_id) REFERENCES checklists(id) ON DELETE CASCADE,
+    FOREIGN KEY (item_id) REFERENCES check_items(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_automation_rules_checklist ON automation_rules(checklist_id);
+CREATE INDEX IF NOT EXISTS idx_automation_rules_item ON automation_rules(item_id);
+
+-- v1.0.0: Release Calendar
+CREATE TABLE IF NOT EXISTS release_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    checklist_id INTEGER,
+    title TEXT NOT NULL,
+    scheduled_start TEXT NOT NULL,
+    scheduled_end TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    owner_email TEXT,
+    status TEXT NOT NULL DEFAULT 'planned',
+    notes TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (checklist_id) REFERENCES checklists(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_release_events_env ON release_events(environment);
+CREATE INDEX IF NOT EXISTS idx_release_events_start ON release_events(scheduled_start);
+CREATE INDEX IF NOT EXISTS idx_release_events_status ON release_events(status);
 """
 
 VALID_LABELS = frozenset({
     "critical", "hotfix", "minor", "major",
     "security", "emergency", "regression", "planned",
+})
+
+VALID_RULE_TYPES = frozenset({
+    "auto_pass_after_date",
+    "auto_pass_when_dependency_met",
+    "auto_fail_after_deadline",
+    "auto_pass_on_label",
+})
+
+VALID_EVENT_STATUSES = frozenset({
+    "planned", "confirmed", "in_progress", "completed", "cancelled",
 })
 
 DEFAULT_CHECKS = [
@@ -157,6 +233,10 @@ DEFAULT_CHECKS = [
     ("rollback",  "Rollback procedure documented",              True),
     ("rollback",  "Previous version artifact available",        True),
 ]
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 async def init_db(path: str) -> aiosqlite.Connection:
@@ -241,7 +321,7 @@ async def _comment_count(db: aiosqlite.Connection, checklist_id: int) -> int:
 # ── Templates ─────────────────────────────────────────────────────────────
 
 async def create_template(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         "INSERT INTO templates (name, description, created_at) VALUES (?, ?, ?)",
         (data["name"], data.get("description"), now),
@@ -326,7 +406,7 @@ async def delete_template(db: aiosqlite.Connection, template_id: int) -> bool:
 # ── Checklists ────────────────────────────────────────────────────────────
 
 async def create_checklist(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         """INSERT INTO checklists (name, service, version, environment, owner_email, description, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -411,6 +491,10 @@ async def delete_checklist(db: aiosqlite.Connection, checklist_id: int) -> bool:
     await db.execute("DELETE FROM rollback_plans WHERE checklist_id = ?", (checklist_id,))
     await db.execute("DELETE FROM checklist_labels WHERE checklist_id = ?", (checklist_id,))
     await db.execute("DELETE FROM checklist_watchers WHERE checklist_id = ?", (checklist_id,))
+    await db.execute("DELETE FROM automation_rules WHERE checklist_id = ?", (checklist_id,))
+    await db.execute("DELETE FROM gate_approvals WHERE gate_id IN (SELECT id FROM approval_gates WHERE checklist_id = ?)", (checklist_id,))
+    await db.execute("DELETE FROM approval_gates WHERE checklist_id = ?", (checklist_id,))
+    await db.execute("UPDATE release_events SET checklist_id = NULL WHERE checklist_id = ?", (checklist_id,))
     await db.execute("DELETE FROM checklists WHERE id = ?", (checklist_id,))
     await db.commit()
     return True
@@ -444,7 +528,7 @@ async def update_check_item(db: aiosqlite.Connection, item_id: int,
         dep_err = await _check_dependency(db, item_id)
         if dep_err:
             return dep_err
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     await db.execute(
         "UPDATE check_items SET status=?, notes=?, checked_by=?, checked_at=? WHERE id=?",
         (status, notes, checked_by, now, item_id)
@@ -467,7 +551,7 @@ async def add_check_item(db: aiosqlite.Connection, data: dict) -> dict:
 
 
 async def create_rollback_plan(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     await db.execute(
         "INSERT OR REPLACE INTO rollback_plans (checklist_id, steps, estimated_minutes, contacts, created_at) VALUES (?, ?, ?, ?, ?)",
         (data["checklist_id"], json.dumps(data["steps"]),
@@ -490,7 +574,7 @@ async def add_sign_off(db: aiosqlite.Connection, checklist_id: int, data: dict) 
     stats = await _compute_stats(db, checklist_id)
     if stats["blocking_failures"] > 0:
         return "blocking_failures"
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         "INSERT INTO sign_offs (checklist_id, name, role, comment, signed_at) VALUES (?,?,?,?,?)",
         (checklist_id, data["name"], data["role"], data.get("comment"), now),
@@ -520,7 +604,11 @@ async def complete_checklist(db: aiosqlite.Connection, checklist_id: int) -> dic
     stats = await _compute_stats(db, checklist_id)
     if stats["blocking_failures"] > 0:
         return "blocking_failures"
-    now = datetime.now(timezone.utc).isoformat()
+    # v1.0.0: all approval gates must be approved before completion
+    all_gates_ok = await check_all_gates_approved(db, checklist_id)
+    if not all_gates_ok:
+        return "gates_not_approved"
+    now = _now()
     await db.execute(
         "UPDATE checklists SET status='completed', completed_at=? WHERE id=?",
         (now, checklist_id),
@@ -631,7 +719,7 @@ async def clone_checklist(db: aiosqlite.Connection, checklist_id: int,
     if not src:
         return None
     s = src[0]
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     name = new_name or f"{s['name']} (clone)"
     cur = await db.execute(
         """INSERT INTO checklists (name, service, version, environment, owner_email, description, created_at)
@@ -655,7 +743,7 @@ async def clone_checklist(db: aiosqlite.Connection, checklist_id: int,
 
 async def bulk_update_items(db: aiosqlite.Connection, checklist_id: int,
                              updates: list[dict]) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     updated = []
     not_found = []
     dep_blocked = []
@@ -685,7 +773,7 @@ async def bulk_update_items(db: aiosqlite.Connection, checklist_id: int,
 # ── Release Windows ──────────────────────────────────────────────────────
 
 async def create_release_window(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     days = json.dumps(sorted(set(data["day_of_week"])))
     cur = await db.execute(
         "INSERT INTO release_windows (environment, day_of_week, start_hour, end_hour, description, created_at) VALUES (?,?,?,?,?,?)",
@@ -769,7 +857,7 @@ async def assign_check_item(db: aiosqlite.Connection, item_id: int, data: dict) 
     item = item_rows[0]
     # Remove existing assignment if any
     await db.execute("DELETE FROM check_assignments WHERE item_id=?", (item_id,))
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         "INSERT INTO check_assignments (item_id, checklist_id, assignee_email, due_at, created_at) VALUES (?,?,?,?,?)",
         (item_id, item["checklist_id"], data["assignee_email"], data.get("due_at"), now),
@@ -796,7 +884,7 @@ async def list_assignments(db: aiosqlite.Connection, checklist_id: int,
 
 
 async def get_overdue_assignments(db: aiosqlite.Connection, checklist_id: int) -> list[dict]:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     rows = await db.execute_fetchall(
         "SELECT a.*, ci.title, ci.category, ci.status as item_status FROM check_assignments a "
         "JOIN check_items ci ON a.item_id = ci.id "
@@ -811,7 +899,7 @@ def _assignment_row(rows) -> dict | None:
 
 
 def _assignment_row_single(r) -> dict:
-    now_str = datetime.now(timezone.utc).isoformat()
+    now_str = _now()
     is_overdue = (r["due_at"] is not None and r["due_at"] < now_str and r["item_status"] == "pending")
     return {
         "id": r["id"],
@@ -1075,7 +1163,7 @@ async def add_comment(db: aiosqlite.Connection, checklist_id: int, data: dict) -
     cl = await db.execute_fetchall("SELECT id FROM checklists WHERE id = ?", (checklist_id,))
     if not cl:
         return None
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         "INSERT INTO checklist_comments (checklist_id, author, body, created_at) VALUES (?,?,?,?)",
         (checklist_id, data["author"], data["body"], now),
@@ -1114,7 +1202,7 @@ async def promote_checklist(db: aiosqlite.Connection, checklist_id: int,
     s = src[0]
     if s["environment"] == target_env:
         return "same_environment"
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     version = new_version or s["version"]
     owner = owner_email or s["owner_email"]
     name = f"{s['service']} {version} ({target_env})"
@@ -1198,7 +1286,7 @@ async def add_checklist_label(db: aiosqlite.Connection, checklist_id: int,
     cl = await db.execute_fetchall("SELECT id FROM checklists WHERE id = ?", (checklist_id,))
     if not cl:
         return None
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     try:
         cur = await db.execute(
             "INSERT INTO checklist_labels (checklist_id, label, created_at) VALUES (?,?,?)",
@@ -1262,7 +1350,7 @@ async def add_watcher(db: aiosqlite.Connection, checklist_id: int,
     cl = await db.execute_fetchall("SELECT id FROM checklists WHERE id = ?", (checklist_id,))
     if not cl:
         return None
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     try:
         cur = await db.execute(
             "INSERT INTO checklist_watchers (checklist_id, email, name, added_at) VALUES (?,?,?,?)",
@@ -1333,7 +1421,7 @@ async def get_release_velocity(db: aiosqlite.Connection, days: int = 30) -> dict
     )
     total_releases = len(completed_rows)
 
-    # Compute per-release hours (created_at → completed_at)
+    # Compute per-release hours (created_at -> completed_at)
     def _hours(row) -> float | None:
         try:
             c = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
@@ -1440,4 +1528,543 @@ async def get_release_velocity(db: aiosqlite.Connection, days: int = 30) -> dict
         "bottleneck_categories": bottleneck_categories,
         "fastest_release": fastest_release,
         "slowest_release": slowest_release,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Feature 1: Release Approvals (v1.0.0)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _gate_decision_row(r) -> dict:
+    return {
+        "id": r["id"],
+        "gate_id": r["gate_id"],
+        "approver_email": r["approver_email"],
+        "approver_role": r["approver_role"],
+        "decision": r["decision"],
+        "comment": r["comment"],
+        "decided_at": r["decided_at"],
+    }
+
+
+async def _gate_row(db: aiosqlite.Connection, r) -> dict:
+    """Build a full ApprovalGateResponse dict from a gate row."""
+    decision_rows = await db.execute_fetchall(
+        "SELECT * FROM gate_approvals WHERE gate_id = ? ORDER BY decided_at ASC",
+        (r["id"],),
+    )
+    approvals = [_gate_decision_row(d) for d in decision_rows]
+    approvals_count = sum(1 for d in decision_rows if d["decision"] == "approved")
+    rejections_count = sum(1 for d in decision_rows if d["decision"] == "rejected")
+    return {
+        "id": r["id"],
+        "checklist_id": r["checklist_id"],
+        "name": r["name"],
+        "required_roles": json.loads(r["required_roles"]),
+        "min_approvals": r["min_approvals"],
+        "status": r["status"],
+        "approvals_count": approvals_count,
+        "rejections_count": rejections_count,
+        "approvals": approvals,
+        "created_at": r["created_at"],
+    }
+
+
+async def create_approval_gate(db: aiosqlite.Connection, checklist_id: int,
+                                data: dict) -> dict | None:
+    """Create an approval gate for a checklist. Returns None if checklist not found."""
+    cl = await db.execute_fetchall("SELECT id FROM checklists WHERE id = ?", (checklist_id,))
+    if not cl:
+        return None
+    now = _now()
+    roles_json = json.dumps(data["required_roles"])
+    min_approvals = data.get("min_approvals", 1)
+    cur = await db.execute(
+        "INSERT INTO approval_gates (checklist_id, name, required_roles, min_approvals, status, created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (checklist_id, data["name"], roles_json, min_approvals, "pending", now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM approval_gates WHERE id = ?", (cur.lastrowid,))
+    return await _gate_row(db, rows[0])
+
+
+async def list_approval_gates(db: aiosqlite.Connection, checklist_id: int) -> list[dict]:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM approval_gates WHERE checklist_id = ? ORDER BY created_at ASC",
+        (checklist_id,),
+    )
+    return [await _gate_row(db, r) for r in rows]
+
+
+async def get_approval_gate(db: aiosqlite.Connection, gate_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM approval_gates WHERE id = ?", (gate_id,))
+    if not rows:
+        return None
+    return await _gate_row(db, rows[0])
+
+
+async def approve_or_reject_gate(db: aiosqlite.Connection, gate_id: int,
+                                  data: dict) -> dict | str | None:
+    """Submit an approval/rejection decision for a gate.
+    Returns:
+      - None if gate not found
+      - 'invalid_role' if approver_role not in required_roles
+      - 'duplicate' if approver already decided
+      - 'gate_already_resolved' if gate is already approved/rejected
+      - GateDecisionResponse dict on success
+    """
+    gate_rows = await db.execute_fetchall("SELECT * FROM approval_gates WHERE id = ?", (gate_id,))
+    if not gate_rows:
+        return None
+    gate = gate_rows[0]
+    if gate["status"] in ("approved", "rejected"):
+        return "gate_already_resolved"
+    required_roles = json.loads(gate["required_roles"])
+    if data["approver_role"] not in required_roles:
+        return "invalid_role"
+    # Check for duplicate
+    existing = await db.execute_fetchall(
+        "SELECT id FROM gate_approvals WHERE gate_id = ? AND approver_email = ?",
+        (gate_id, data["approver_email"]),
+    )
+    if existing:
+        return "duplicate"
+    now = _now()
+    cur = await db.execute(
+        "INSERT INTO gate_approvals (gate_id, approver_email, approver_role, decision, comment, decided_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (gate_id, data["approver_email"], data["approver_role"],
+         data["decision"], data.get("comment"), now),
+    )
+    await db.commit()
+
+    # Auto-update gate status
+    if data["decision"] == "rejected":
+        await db.execute(
+            "UPDATE approval_gates SET status = 'rejected' WHERE id = ?", (gate_id,))
+        await db.commit()
+    else:
+        # Count approvals
+        approval_count_rows = await db.execute_fetchall(
+            "SELECT COUNT(*) as cnt FROM gate_approvals WHERE gate_id = ? AND decision = 'approved'",
+            (gate_id,),
+        )
+        approval_count = approval_count_rows[0]["cnt"]
+        if approval_count >= gate["min_approvals"]:
+            await db.execute(
+                "UPDATE approval_gates SET status = 'approved' WHERE id = ?", (gate_id,))
+            await db.commit()
+
+    rows = await db.execute_fetchall("SELECT * FROM gate_approvals WHERE id = ?", (cur.lastrowid,))
+    return _gate_decision_row(rows[0])
+
+
+async def check_all_gates_approved(db: aiosqlite.Connection, checklist_id: int) -> bool:
+    """Return True if all gates for the checklist are approved (or if there are no gates)."""
+    gates = await db.execute_fetchall(
+        "SELECT status FROM approval_gates WHERE checklist_id = ?", (checklist_id,))
+    if not gates:
+        return True
+    return all(g["status"] == "approved" for g in gates)
+
+
+async def get_gates_status(db: aiosqlite.Connection, checklist_id: int) -> dict:
+    """Return summary of all gates' statuses for a checklist."""
+    gates = await db.execute_fetchall(
+        "SELECT status FROM approval_gates WHERE checklist_id = ?", (checklist_id,))
+    total = len(gates)
+    approved = sum(1 for g in gates if g["status"] == "approved")
+    pending = sum(1 for g in gates if g["status"] == "pending")
+    rejected = sum(1 for g in gates if g["status"] == "rejected")
+    return {
+        "checklist_id": checklist_id,
+        "total_gates": total,
+        "approved_gates": approved,
+        "pending_gates": pending,
+        "rejected_gates": rejected,
+        "all_approved": total > 0 and approved == total,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Feature 2: Checklist Automation Rules (v1.0.0)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _automation_rule_row(r) -> dict:
+    return {
+        "id": r["id"],
+        "checklist_id": r["checklist_id"],
+        "item_id": r["item_id"],
+        "rule_type": r["rule_type"],
+        "condition": json.loads(r["condition"]),
+        "is_enabled": bool(r["is_enabled"]),
+        "times_fired": r["times_fired"],
+        "last_fired_at": r["last_fired_at"],
+        "created_at": r["created_at"],
+    }
+
+
+async def create_automation_rule(db: aiosqlite.Connection, checklist_id: int,
+                                  data: dict) -> dict | str | None:
+    """Create an automation rule. Returns None if checklist not found,
+    'item_not_in_checklist' if item doesn't belong to checklist,
+    'invalid_rule_type' if rule_type is not valid."""
+    cl = await db.execute_fetchall("SELECT id FROM checklists WHERE id = ?", (checklist_id,))
+    if not cl:
+        return None
+    if data["rule_type"] not in VALID_RULE_TYPES:
+        return "invalid_rule_type"
+    item_rows = await db.execute_fetchall(
+        "SELECT id FROM check_items WHERE id = ? AND checklist_id = ?",
+        (data["item_id"], checklist_id),
+    )
+    if not item_rows:
+        return "item_not_in_checklist"
+    now = _now()
+    condition_json = json.dumps(data["condition"])
+    is_enabled = int(data.get("is_enabled", True))
+    cur = await db.execute(
+        "INSERT INTO automation_rules (checklist_id, item_id, rule_type, condition, is_enabled, created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (checklist_id, data["item_id"], data["rule_type"], condition_json, is_enabled, now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM automation_rules WHERE id = ?", (cur.lastrowid,))
+    return _automation_rule_row(rows[0])
+
+
+async def list_automation_rules(db: aiosqlite.Connection, checklist_id: int) -> list[dict]:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM automation_rules WHERE checklist_id = ? ORDER BY created_at ASC",
+        (checklist_id,),
+    )
+    return [_automation_rule_row(r) for r in rows]
+
+
+async def update_automation_rule(db: aiosqlite.Connection, rule_id: int,
+                                  data: dict) -> dict | None:
+    """Update condition and/or is_enabled on a rule. Returns None if not found."""
+    rows = await db.execute_fetchall("SELECT * FROM automation_rules WHERE id = ?", (rule_id,))
+    if not rows:
+        return None
+    sets = []
+    params = []
+    if data.get("condition") is not None:
+        sets.append("condition = ?")
+        params.append(json.dumps(data["condition"]))
+    if data.get("is_enabled") is not None:
+        sets.append("is_enabled = ?")
+        params.append(int(data["is_enabled"]))
+    if not sets:
+        return _automation_rule_row(rows[0])
+    params.append(rule_id)
+    await db.execute(f"UPDATE automation_rules SET {', '.join(sets)} WHERE id = ?", params)
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM automation_rules WHERE id = ?", (rule_id,))
+    return _automation_rule_row(rows[0])
+
+
+async def delete_automation_rule(db: aiosqlite.Connection, rule_id: int) -> bool:
+    cur = await db.execute("DELETE FROM automation_rules WHERE id = ?", (rule_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def evaluate_automation_rules(db: aiosqlite.Connection, checklist_id: int) -> dict:
+    """Evaluate all enabled rules for a checklist, apply actions, return fired count."""
+    rules = await db.execute_fetchall(
+        "SELECT * FROM automation_rules WHERE checklist_id = ? AND is_enabled = 1",
+        (checklist_id,),
+    )
+    now = _now()
+    fired_count = 0
+    fired_rules: list[dict] = []
+
+    # Pre-fetch labels for label-based rules
+    labels = await _checklist_labels(db, checklist_id)
+
+    for rule in rules:
+        condition = json.loads(rule["condition"])
+        rule_type = rule["rule_type"]
+        item_id = rule["item_id"]
+        should_fire = False
+        new_status = None
+
+        # Fetch current item status
+        item_rows = await db.execute_fetchall(
+            "SELECT status FROM check_items WHERE id = ?", (item_id,))
+        if not item_rows:
+            continue
+        current_status = item_rows[0]["status"]
+        # Skip if already resolved (pass or fail)
+        if current_status in ("pass", "fail"):
+            continue
+
+        if rule_type == "auto_pass_after_date":
+            target_date = condition.get("date", "")
+            if target_date and now >= target_date:
+                should_fire = True
+                new_status = "pass"
+
+        elif rule_type == "auto_fail_after_deadline":
+            deadline = condition.get("deadline", "")
+            if deadline and now >= deadline:
+                should_fire = True
+                new_status = "fail"
+
+        elif rule_type == "auto_pass_when_dependency_met":
+            dep_item_ids = condition.get("item_ids", [])
+            if dep_item_ids:
+                placeholders = ",".join("?" * len(dep_item_ids))
+                dep_rows = await db.execute_fetchall(
+                    f"SELECT id, status FROM check_items WHERE id IN ({placeholders})",
+                    dep_item_ids,
+                )
+                if len(dep_rows) == len(dep_item_ids) and all(
+                    d["status"] == "pass" for d in dep_rows
+                ):
+                    should_fire = True
+                    new_status = "pass"
+
+        elif rule_type == "auto_pass_on_label":
+            target_label = condition.get("label", "")
+            if target_label and target_label in labels:
+                should_fire = True
+                new_status = "pass"
+
+        if should_fire and new_status:
+            await db.execute(
+                "UPDATE check_items SET status = ?, checked_by = ?, checked_at = ?, notes = ? WHERE id = ?",
+                (new_status, "automation", now,
+                 f"Auto-{new_status} by rule '{rule_type}'", item_id),
+            )
+            await db.execute(
+                "UPDATE automation_rules SET times_fired = times_fired + 1, last_fired_at = ? WHERE id = ?",
+                (now, rule["id"]),
+            )
+            fired_count += 1
+            fired_rules.append({
+                "rule_id": rule["id"],
+                "item_id": item_id,
+                "rule_type": rule_type,
+                "new_status": new_status,
+            })
+
+    if fired_count > 0:
+        await db.commit()
+
+    return {
+        "checklist_id": checklist_id,
+        "rules_evaluated": len(rules),
+        "rules_fired": fired_count,
+        "fired_details": fired_rules,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Feature 3: Release Calendar (v1.0.0)
+# ══════════════════════════════════════════════════════════════════════════
+
+async def _release_event_row(db: aiosqlite.Connection, r, check_conflicts: bool = True) -> dict:
+    """Build a ReleaseEventResponse dict from a release_events row."""
+    checklist_name = None
+    if r["checklist_id"]:
+        cl_rows = await db.execute_fetchall(
+            "SELECT name FROM checklists WHERE id = ?", (r["checklist_id"],))
+        if cl_rows:
+            checklist_name = cl_rows[0]["name"]
+
+    has_conflicts = False
+    if check_conflicts:
+        # Check if this event overlaps with any other event in the same environment
+        conflicts = await db.execute_fetchall(
+            """SELECT id FROM release_events
+               WHERE environment = ? AND id != ?
+               AND scheduled_start < ? AND scheduled_end > ?""",
+            (r["environment"], r["id"], r["scheduled_end"], r["scheduled_start"]),
+        )
+        has_conflicts = len(conflicts) > 0
+
+    return {
+        "id": r["id"],
+        "checklist_id": r["checklist_id"],
+        "checklist_name": checklist_name,
+        "title": r["title"],
+        "scheduled_start": r["scheduled_start"],
+        "scheduled_end": r["scheduled_end"],
+        "environment": r["environment"],
+        "owner_email": r["owner_email"],
+        "status": r["status"],
+        "notes": r["notes"],
+        "has_conflicts": has_conflicts,
+        "created_at": r["created_at"],
+        "updated_at": r["updated_at"],
+    }
+
+
+async def create_release_event(db: aiosqlite.Connection, data: dict) -> dict | str:
+    """Create a release calendar event. Returns 'invalid_checklist' if checklist_id specified but not found."""
+    if data.get("checklist_id"):
+        cl = await db.execute_fetchall(
+            "SELECT id FROM checklists WHERE id = ?", (data["checklist_id"],))
+        if not cl:
+            return "invalid_checklist"
+    now = _now()
+    cur = await db.execute(
+        """INSERT INTO release_events
+           (checklist_id, title, scheduled_start, scheduled_end, environment, owner_email, status, notes, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (data.get("checklist_id"), data["title"], data["scheduled_start"],
+         data["scheduled_end"], data["environment"],
+         data.get("owner_email"), "planned", data.get("notes"), now, now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM release_events WHERE id = ?", (cur.lastrowid,))
+    return await _release_event_row(db, rows[0])
+
+
+async def list_release_events(db: aiosqlite.Connection,
+                               environment: str | None = None,
+                               status: str | None = None,
+                               from_date: str | None = None,
+                               to_date: str | None = None) -> list[dict]:
+    q = "SELECT * FROM release_events"
+    conds = []
+    params: list = []
+    if environment:
+        conds.append("environment = ?")
+        params.append(environment)
+    if status:
+        conds.append("status = ?")
+        params.append(status)
+    if from_date:
+        conds.append("scheduled_end >= ?")
+        params.append(from_date)
+    if to_date:
+        conds.append("scheduled_start <= ?")
+        params.append(to_date)
+    if conds:
+        q += " WHERE " + " AND ".join(conds)
+    q += " ORDER BY scheduled_start ASC"
+    rows = await db.execute_fetchall(q, params)
+    return [await _release_event_row(db, r) for r in rows]
+
+
+async def get_release_event(db: aiosqlite.Connection, event_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM release_events WHERE id = ?", (event_id,))
+    if not rows:
+        return None
+    return await _release_event_row(db, rows[0])
+
+
+async def update_release_event(db: aiosqlite.Connection, event_id: int,
+                                data: dict) -> dict | str | None:
+    """Update a release event. Returns None if not found, 'invalid_status' if bad status."""
+    rows = await db.execute_fetchall("SELECT * FROM release_events WHERE id = ?", (event_id,))
+    if not rows:
+        return None
+    sets = []
+    params: list = []
+    if data.get("title") is not None:
+        sets.append("title = ?")
+        params.append(data["title"])
+    if data.get("scheduled_start") is not None:
+        sets.append("scheduled_start = ?")
+        params.append(data["scheduled_start"])
+    if data.get("scheduled_end") is not None:
+        sets.append("scheduled_end = ?")
+        params.append(data["scheduled_end"])
+    if data.get("status") is not None:
+        if data["status"] not in VALID_EVENT_STATUSES:
+            return "invalid_status"
+        sets.append("status = ?")
+        params.append(data["status"])
+    if data.get("notes") is not None:
+        sets.append("notes = ?")
+        params.append(data["notes"])
+    if not sets:
+        return await _release_event_row(db, rows[0])
+    now = _now()
+    sets.append("updated_at = ?")
+    params.append(now)
+    params.append(event_id)
+    await db.execute(f"UPDATE release_events SET {', '.join(sets)} WHERE id = ?", params)
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM release_events WHERE id = ?", (event_id,))
+    return await _release_event_row(db, rows[0])
+
+
+async def delete_release_event(db: aiosqlite.Connection, event_id: int) -> bool:
+    cur = await db.execute("DELETE FROM release_events WHERE id = ?", (event_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def detect_conflicts(db: aiosqlite.Connection,
+                            environment: str | None = None,
+                            from_date: str | None = None,
+                            to_date: str | None = None) -> list[dict]:
+    """Find overlapping release events in the same environment."""
+    q = "SELECT * FROM release_events"
+    conds = []
+    params: list = []
+    if environment:
+        conds.append("environment = ?")
+        params.append(environment)
+    if from_date:
+        conds.append("scheduled_end >= ?")
+        params.append(from_date)
+    if to_date:
+        conds.append("scheduled_start <= ?")
+        params.append(to_date)
+    # Exclude cancelled events from conflict detection
+    conds.append("status != 'cancelled'")
+    if conds:
+        q += " WHERE " + " AND ".join(conds)
+    q += " ORDER BY scheduled_start ASC"
+    rows = await db.execute_fetchall(q, params)
+
+    # Group by environment
+    env_events: dict[str, list] = {}
+    for r in rows:
+        env_events.setdefault(r["environment"], []).append(r)
+
+    conflicts: list[dict] = []
+    for env, events in env_events.items():
+        for i in range(len(events)):
+            for j in range(i + 1, len(events)):
+                a = events[i]
+                b = events[j]
+                # Check overlap: a.start < b.end AND a.end > b.start
+                if a["scheduled_start"] < b["scheduled_end"] and a["scheduled_end"] > b["scheduled_start"]:
+                    overlap_start = max(a["scheduled_start"], b["scheduled_start"])
+                    overlap_end = min(a["scheduled_end"], b["scheduled_end"])
+                    conflicts.append({
+                        "event_a_id": a["id"],
+                        "event_b_id": b["id"],
+                        "event_a_title": a["title"],
+                        "event_b_title": b["title"],
+                        "overlap_start": overlap_start,
+                        "overlap_end": overlap_end,
+                        "environment": env,
+                    })
+    return conflicts
+
+
+async def get_calendar_view(db: aiosqlite.Connection,
+                             from_date: str, to_date: str,
+                             environment: str | None = None) -> dict:
+    """Full calendar view with events, conflicts, and stats."""
+    events = await list_release_events(db, environment=environment,
+                                        from_date=from_date, to_date=to_date)
+    conflicts = await detect_conflicts(db, environment=environment,
+                                        from_date=from_date, to_date=to_date)
+    now = _now()
+    upcoming_count = sum(1 for e in events if e["scheduled_start"] > now and e["status"] != "cancelled")
+    return {
+        "events": events,
+        "conflicts": conflicts,
+        "total_events": len(events),
+        "upcoming_count": upcoming_count,
     }
