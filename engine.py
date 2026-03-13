@@ -83,7 +83,32 @@ CREATE TABLE IF NOT EXISTS checklist_comments (
     FOREIGN KEY (checklist_id) REFERENCES checklists(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS release_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    environment TEXT NOT NULL,
+    day_of_week TEXT NOT NULL DEFAULT '[]',
+    start_hour INTEGER NOT NULL,
+    end_hour INTEGER NOT NULL,
+    description TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS check_assignments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id INTEGER NOT NULL,
+    checklist_id INTEGER NOT NULL,
+    assignee_email TEXT NOT NULL,
+    due_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (item_id) REFERENCES check_items(id) ON DELETE CASCADE,
+    FOREIGN KEY (checklist_id) REFERENCES checklists(id) ON DELETE CASCADE,
+    UNIQUE(item_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_comments_checklist ON checklist_comments(checklist_id);
+CREATE INDEX IF NOT EXISTS idx_windows_env ON release_windows(environment);
+CREATE INDEX IF NOT EXISTS idx_assignments_checklist ON check_assignments(checklist_id);
+CREATE INDEX IF NOT EXISTS idx_assignments_assignee ON check_assignments(assignee_email);
 """
 
 DEFAULT_CHECKS = [
@@ -331,6 +356,7 @@ async def get_checklist(db: aiosqlite.Connection, checklist_id: int) -> dict | N
 
 
 async def delete_checklist(db: aiosqlite.Connection, checklist_id: int) -> bool:
+    await db.execute("DELETE FROM check_assignments WHERE checklist_id = ?", (checklist_id,))
     await db.execute("DELETE FROM checklist_comments WHERE checklist_id = ?", (checklist_id,))
     await db.execute("DELETE FROM sign_offs WHERE checklist_id = ?", (checklist_id,))
     await db.execute("DELETE FROM check_items WHERE checklist_id = ?", (checklist_id,))
@@ -511,7 +537,7 @@ async def get_aggregate_stats(db: aiosqlite.Connection) -> dict:
     if total == 0:
         return {"total_releases": 0, "by_environment": {}, "by_status": {},
                 "avg_readiness_score": 0, "most_failed_checks": [], "services": [],
-                "total_comments": 0}
+                "total_comments": 0, "total_assignments": 0, "release_windows": 0}
 
     by_env: Counter = Counter(r["environment"] for r in cl_rows)
     by_status: Counter = Counter(r["status"] for r in cl_rows)
@@ -533,6 +559,8 @@ async def get_aggregate_stats(db: aiosqlite.Connection) -> dict:
     services = [{"service": r["service"], "releases": r["releases"], "last_release": r["last_release"]} for r in svc_rows]
 
     total_comments = (await db.execute_fetchall("SELECT COUNT(*) as c FROM checklist_comments"))[0]["c"]
+    total_assignments = (await db.execute_fetchall("SELECT COUNT(*) as c FROM check_assignments"))[0]["c"]
+    windows_count = (await db.execute_fetchall("SELECT COUNT(*) as c FROM release_windows"))[0]["c"]
 
     return {
         "total_releases": total,
@@ -542,6 +570,8 @@ async def get_aggregate_stats(db: aiosqlite.Connection) -> dict:
         "most_failed_checks": most_failed,
         "services": services,
         "total_comments": total_comments,
+        "total_assignments": total_assignments,
+        "release_windows": windows_count,
     }
 
 
@@ -600,6 +630,201 @@ async def bulk_update_items(db: aiosqlite.Connection, checklist_id: int,
     await db.commit()
     return {"updated": len(updated), "not_found": not_found, "updated_ids": updated,
             "dependency_blocked": dep_blocked}
+
+
+# ── Release Windows ──────────────────────────────────────────────────────
+
+async def create_release_window(db: aiosqlite.Connection, data: dict) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    days = json.dumps(sorted(set(data["day_of_week"])))
+    cur = await db.execute(
+        "INSERT INTO release_windows (environment, day_of_week, start_hour, end_hour, description, created_at) VALUES (?,?,?,?,?,?)",
+        (data["environment"], days, data["start_hour"], data["end_hour"], data.get("description"), now),
+    )
+    await db.commit()
+    return _window_row(await db.execute_fetchall("SELECT * FROM release_windows WHERE id=?", (cur.lastrowid,)))
+
+
+async def list_release_windows(db: aiosqlite.Connection, environment: str | None = None) -> list[dict]:
+    if environment:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM release_windows WHERE environment=? ORDER BY created_at DESC", (environment,))
+    else:
+        rows = await db.execute_fetchall("SELECT * FROM release_windows ORDER BY created_at DESC")
+    return [_window_row_single(r) for r in rows]
+
+
+async def delete_release_window(db: aiosqlite.Connection, window_id: int) -> bool:
+    cur = await db.execute("DELETE FROM release_windows WHERE id=?", (window_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def check_in_release_window(db: aiosqlite.Connection, environment: str) -> dict:
+    now = datetime.now(timezone.utc)
+    current_day = now.weekday()
+    current_hour = now.hour
+    windows = await db.execute_fetchall(
+        "SELECT * FROM release_windows WHERE environment=?", (environment,))
+    for w in windows:
+        days = json.loads(w["day_of_week"])
+        start_h = w["start_hour"]
+        end_h = w["end_hour"]
+        if current_day in days:
+            if start_h <= end_h:
+                in_window = start_h <= current_hour < end_h
+            else:
+                in_window = current_hour >= start_h or current_hour < end_h
+            if in_window:
+                return {
+                    "environment": environment,
+                    "in_window": True,
+                    "current_day": current_day,
+                    "current_hour": current_hour,
+                    "matching_window": _window_row_single(w),
+                    "message": "Current time is within a release window",
+                }
+    return {
+        "environment": environment,
+        "in_window": len(windows) == 0,
+        "current_day": current_day,
+        "current_hour": current_hour,
+        "matching_window": None,
+        "message": "No release window configured" if not windows else "Current time is outside all release windows",
+    }
+
+
+def _window_row(rows) -> dict:
+    return _window_row_single(rows[0]) if rows else {}
+
+
+def _window_row_single(r) -> dict:
+    return {
+        "id": r["id"],
+        "environment": r["environment"],
+        "day_of_week": json.loads(r["day_of_week"]),
+        "start_hour": r["start_hour"],
+        "end_hour": r["end_hour"],
+        "description": r["description"],
+        "created_at": r["created_at"],
+    }
+
+
+# ── Check Item Assignments ───────────────────────────────────────────────
+
+async def assign_check_item(db: aiosqlite.Connection, item_id: int, data: dict) -> dict | str | None:
+    item_rows = await db.execute_fetchall("SELECT * FROM check_items WHERE id=?", (item_id,))
+    if not item_rows:
+        return None
+    item = item_rows[0]
+    # Remove existing assignment if any
+    await db.execute("DELETE FROM check_assignments WHERE item_id=?", (item_id,))
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        "INSERT INTO check_assignments (item_id, checklist_id, assignee_email, due_at, created_at) VALUES (?,?,?,?,?)",
+        (item_id, item["checklist_id"], data["assignee_email"], data.get("due_at"), now),
+    )
+    await db.commit()
+    return _assignment_row(
+        await db.execute_fetchall(
+            "SELECT a.*, ci.title, ci.category, ci.status as item_status FROM check_assignments a "
+            "JOIN check_items ci ON a.item_id = ci.id WHERE a.id=?", (cur.lastrowid,)),
+    )
+
+
+async def list_assignments(db: aiosqlite.Connection, checklist_id: int,
+                            assignee: str | None = None) -> list[dict]:
+    q = ("SELECT a.*, ci.title, ci.category, ci.status as item_status FROM check_assignments a "
+         "JOIN check_items ci ON a.item_id = ci.id WHERE a.checklist_id = ?")
+    params: list = [checklist_id]
+    if assignee:
+        q += " AND a.assignee_email = ?"
+        params.append(assignee)
+    q += " ORDER BY a.due_at ASC NULLS LAST, a.created_at ASC"
+    rows = await db.execute_fetchall(q, params)
+    return [_assignment_row_single(r) for r in rows]
+
+
+async def get_overdue_assignments(db: aiosqlite.Connection, checklist_id: int) -> list[dict]:
+    now = datetime.now(timezone.utc).isoformat()
+    rows = await db.execute_fetchall(
+        "SELECT a.*, ci.title, ci.category, ci.status as item_status FROM check_assignments a "
+        "JOIN check_items ci ON a.item_id = ci.id "
+        "WHERE a.checklist_id = ? AND a.due_at IS NOT NULL AND a.due_at < ? AND ci.status = 'pending'",
+        (checklist_id, now),
+    )
+    return [_assignment_row_single(r) for r in rows]
+
+
+def _assignment_row(rows) -> dict | None:
+    return _assignment_row_single(rows[0]) if rows else None
+
+
+def _assignment_row_single(r) -> dict:
+    now_str = datetime.now(timezone.utc).isoformat()
+    is_overdue = (r["due_at"] is not None and r["due_at"] < now_str and r["item_status"] == "pending")
+    return {
+        "id": r["id"],
+        "item_id": r["item_id"],
+        "checklist_id": r["checklist_id"],
+        "title": r["title"],
+        "category": r["category"],
+        "assignee_email": r["assignee_email"],
+        "due_at": r["due_at"],
+        "status": r["item_status"],
+        "is_overdue": is_overdue,
+        "created_at": r["created_at"],
+    }
+
+
+# ── Release Comparison ───────────────────────────────────────────────────
+
+async def compare_releases(db: aiosqlite.Connection, id_a: int, id_b: int) -> dict | None:
+    cl_a = await get_checklist(db, id_a)
+    cl_b = await get_checklist(db, id_b)
+    if not cl_a or not cl_b:
+        return None
+    items_a = await list_check_items(db, id_a)
+    items_b = await list_check_items(db, id_b)
+
+    # Category breakdown
+    cats = sorted(set(i["category"] for i in items_a + items_b))
+    category_breakdown = []
+    for cat in cats:
+        a_items = [i for i in items_a if i["category"] == cat]
+        b_items = [i for i in items_b if i["category"] == cat]
+        category_breakdown.append({
+            "category": cat,
+            "checklist_a_passed": sum(1 for i in a_items if i["status"] == "pass"),
+            "checklist_a_total": len(a_items),
+            "checklist_b_passed": sum(1 for i in b_items if i["status"] == "pass"),
+            "checklist_b_total": len(b_items),
+        })
+
+    # Common failures
+    failed_a = {i["title"] for i in items_a if i["status"] == "fail"}
+    failed_b = {i["title"] for i in items_b if i["status"] == "fail"}
+    common_failures = sorted(failed_a & failed_b)
+    unique_to_a = sorted(failed_a - failed_b)
+    unique_to_b = sorted(failed_b - failed_a)
+
+    # Status diff
+    status_diff = {}
+    for key in ("status", "environment", "readiness_score", "total_checks",
+                "passed_checks", "failed_checks"):
+        if cl_a.get(key) != cl_b.get(key):
+            status_diff[key] = {"a": cl_a.get(key), "b": cl_b.get(key)}
+
+    return {
+        "checklist_a": cl_a,
+        "checklist_b": cl_b,
+        "score_diff": cl_a["readiness_score"] - cl_b["readiness_score"],
+        "status_diff": status_diff,
+        "category_breakdown": category_breakdown,
+        "common_failures": common_failures,
+        "unique_to_a": unique_to_a,
+        "unique_to_b": unique_to_b,
+    }
 
 
 # ── Timeline ─────────────────────────────────────────────────────────────
@@ -765,6 +990,14 @@ async def get_risk_assessment(db: aiosqlite.Connection, checklist_id: int) -> di
             "factor": "security_failures", "severity": "critical",
             "detail": f"{len(security_fails)} security check(s) failed", "impact": 20,
         })
+    # Check release window
+    window_check = await check_in_release_window(db, cl["environment"])
+    if not window_check["in_window"] and window_check["matching_window"] is None and window_check["message"] != "No release window configured":
+        risk_score += 10
+        risk_factors.append({
+            "factor": "outside_release_window", "severity": "medium",
+            "detail": "Current time is outside the configured release window", "impact": 10,
+        })
 
     risk_score = min(risk_score, 100)
     if risk_score >= 60:
@@ -869,6 +1102,7 @@ async def export_checklist_csv(db: aiosqlite.Connection, checklist_id: int) -> s
         return None
     items = await list_check_items(db, checklist_id)
     sign_offs = await list_sign_offs(db, checklist_id)
+    assignments = await list_assignments(db, checklist_id)
 
     buf = io.StringIO()
     # Header section
@@ -883,6 +1117,14 @@ async def export_checklist_csv(db: aiosqlite.Connection, checklist_id: int) -> s
     writer.writeheader()
     for item in items:
         writer.writerow({k: item.get(k, "") for k in fieldnames})
+
+    if assignments:
+        buf.write("\n# Assignments\n")
+        a_fields = ["item_id", "title", "assignee_email", "due_at", "status", "is_overdue"]
+        a_writer = csv.DictWriter(buf, fieldnames=a_fields)
+        a_writer.writeheader()
+        for a in assignments:
+            a_writer.writerow({k: a.get(k, "") for k in a_fields})
 
     if sign_offs:
         buf.write("\n# Sign-Offs\n")
