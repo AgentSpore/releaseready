@@ -12,6 +12,7 @@ from models import (
     ReadinessReport, BulkItemUpdate,
     SignOffCreate, SignOffResponse,
     TemplateCreate, TemplateResponse, TemplateItemCreate,
+    ReleaseTimeline, ServiceReleases, RiskAssessment,
 )
 from engine import (
     init_db, create_checklist, list_checklists, get_checklist, delete_checklist,
@@ -21,6 +22,7 @@ from engine import (
     add_sign_off, list_sign_offs, complete_checklist,
     create_template, list_templates, get_template, get_template_items,
     add_template_item, delete_template,
+    get_release_timeline, get_service_releases, get_risk_assessment,
 )
 
 DB_PATH = os.getenv("DB_PATH", "releaseready.db")
@@ -37,9 +39,10 @@ app = FastAPI(
     title="ReleaseReady",
     description=(
         "Production release readiness checklist with templates, check dependencies, "
-        "sign-off workflow, rollback playbooks, and deployment gates."
+        "sign-off workflow, rollback playbooks, deployment gates, "
+        "release timeline, service release cadence, and automated risk assessment."
     ),
-    version="0.5.0",
+    version="0.6.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -47,7 +50,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.5.0"}
+    return {"status": "ok", "version": "0.6.0"}
 
 
 # ── Templates ─────────────────────────────────────────────────────────────
@@ -143,6 +146,28 @@ async def clone(
     new_name: str | None = Query(None, description="Optional name override for the clone"),
 ):
     result = await clone_checklist(app.state.db, checklist_id, new_version, new_name)
+    if not result:
+        raise HTTPException(404, "Checklist not found")
+    return result
+
+
+# ── Timeline ─────────────────────────────────────────────────────────────
+
+@app.get("/checklists/{checklist_id}/timeline", response_model=ReleaseTimeline)
+async def timeline(checklist_id: int):
+    """Chronological timeline of all actions on this release checklist."""
+    result = await get_release_timeline(app.state.db, checklist_id)
+    if not result:
+        raise HTTPException(404, "Checklist not found")
+    return result
+
+
+# ── Risk Assessment ──────────────────────────────────────────────────────
+
+@app.get("/checklists/{checklist_id}/risk", response_model=RiskAssessment)
+async def risk_assessment(checklist_id: int):
+    """Automated risk scoring based on check failures, environment, and configuration."""
+    result = await get_risk_assessment(app.state.db, checklist_id)
     if not result:
         raise HTTPException(404, "Checklist not found")
     return result
@@ -244,3 +269,14 @@ async def readiness_report(checklist_id: int):
     if not report:
         raise HTTPException(404, "Checklist not found")
     return report
+
+
+# ── Service Releases ─────────────────────────────────────────────────────
+
+@app.get("/services/{service_name}/releases", response_model=ServiceReleases)
+async def service_releases(
+    service_name: str,
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Release history for a specific service with cadence metrics."""
+    return await get_service_releases(app.state.db, service_name, limit)
