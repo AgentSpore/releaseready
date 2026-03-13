@@ -370,3 +370,144 @@ class ReleaseVelocity(BaseModel):
     bottleneck_categories: list[BottleneckCategory]
     fastest_release: FastestSlowestRelease | None
     slowest_release: FastestSlowestRelease | None
+
+
+# ── Release Approvals (v1.0.0) ───────────────────────────────────────────
+
+class ApprovalGateCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200, description="Gate name, e.g. 'Security Review'")
+    required_roles: list[str] = Field(
+        ..., min_length=1,
+        description="Roles allowed to approve: qa, security, pm, engineering, devops, etc.",
+    )
+    min_approvals: int = Field(1, ge=1, description="Minimum approvals needed to pass the gate")
+
+
+class GateDecision(BaseModel):
+    approver_email: str = Field(..., min_length=1, max_length=254, description="Approver email")
+    approver_role: str = Field(..., min_length=1, max_length=80, description="Approver role")
+    decision: str = Field(..., description="approved | rejected")
+    comment: Optional[str] = Field(None, max_length=1000)
+
+
+class GateDecisionResponse(BaseModel):
+    id: int
+    gate_id: int
+    approver_email: str
+    approver_role: str
+    decision: str
+    comment: Optional[str]
+    decided_at: str
+
+
+class ApprovalGateResponse(BaseModel):
+    id: int
+    checklist_id: int
+    name: str
+    required_roles: list[str]
+    min_approvals: int
+    status: str
+    approvals_count: int
+    rejections_count: int
+    approvals: list[GateDecisionResponse]
+    created_at: str
+
+
+class AllGatesStatus(BaseModel):
+    checklist_id: int
+    total_gates: int
+    approved_gates: int
+    pending_gates: int
+    rejected_gates: int
+    all_approved: bool
+
+
+# ── Checklist Automation Rules (v1.0.0) ──────────────────────────────────
+
+class AutomationRuleCreate(BaseModel):
+    item_id: int = Field(..., description="Check item ID this rule applies to")
+    rule_type: str = Field(
+        ...,
+        description="auto_pass_after_date | auto_pass_when_dependency_met | auto_fail_after_deadline | auto_pass_on_label",
+    )
+    condition: dict = Field(
+        ...,
+        description=(
+            "Condition JSON. Examples: "
+            '{\"date\": \"2026-03-15\"} for auto_pass_after_date, '
+            '{\"item_ids\": [1,2,3]} for auto_pass_when_dependency_met, '
+            '{\"deadline\": \"2026-03-20\"} for auto_fail_after_deadline, '
+            '{\"label\": \"hotfix\"} for auto_pass_on_label'
+        ),
+    )
+    is_enabled: bool = Field(True, description="Whether the rule is active")
+
+
+class AutomationRuleUpdate(BaseModel):
+    condition: Optional[dict] = None
+    is_enabled: Optional[bool] = None
+
+
+class AutomationRuleResponse(BaseModel):
+    id: int
+    checklist_id: int
+    item_id: int
+    rule_type: str
+    condition: dict
+    is_enabled: bool
+    times_fired: int
+    last_fired_at: Optional[str]
+    created_at: str
+
+
+# ── Release Calendar (v1.0.0) ────────────────────────────────────────────
+
+class ReleaseEventCreate(BaseModel):
+    checklist_id: Optional[int] = Field(None, description="Associated checklist ID")
+    title: str = Field(..., min_length=1, max_length=200, description="Event title")
+    scheduled_start: str = Field(..., description="Start time in ISO format")
+    scheduled_end: str = Field(..., description="End time in ISO format")
+    environment: str = Field(..., description="Target environment")
+    owner_email: Optional[str] = Field(None, max_length=254, description="Owner email")
+    notes: Optional[str] = Field(None, max_length=2000, description="Additional notes")
+
+
+class ReleaseEventUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+    scheduled_start: Optional[str] = None
+    scheduled_end: Optional[str] = None
+    status: Optional[str] = Field(None, description="planned | confirmed | in_progress | completed | cancelled")
+    notes: Optional[str] = Field(None, max_length=2000)
+
+
+class ReleaseEventResponse(BaseModel):
+    id: int
+    checklist_id: Optional[int]
+    checklist_name: Optional[str]
+    title: str
+    scheduled_start: str
+    scheduled_end: str
+    environment: str
+    owner_email: Optional[str]
+    status: str
+    notes: Optional[str]
+    has_conflicts: bool
+    created_at: str
+    updated_at: str
+
+
+class CalendarConflict(BaseModel):
+    event_a_id: int
+    event_b_id: int
+    event_a_title: str
+    event_b_title: str
+    overlap_start: str
+    overlap_end: str
+    environment: str
+
+
+class CalendarView(BaseModel):
+    events: list[ReleaseEventResponse]
+    conflicts: list[CalendarConflict]
+    total_events: int
+    upcoming_count: int
