@@ -228,3 +228,74 @@ class PromoteRequest(BaseModel):
     target_environment: str = Field(..., description="Target environment: staging | production | canary")
     new_version: Optional[str] = Field(None, description="Override version for promoted checklist")
     owner_email: Optional[str] = Field(None, description="Override owner for promoted checklist")
+
+
+# ── Release Windows ──────────────────────────────────────────────────────
+
+class ReleaseWindowCreate(BaseModel):
+    environment: str = Field(..., description="Environment this window applies to")
+    day_of_week: list[int] = Field(..., min_length=1, max_length=7,
+                                    description="Days of week (0=Monday, 6=Sunday)")
+    start_hour: int = Field(..., ge=0, le=23, description="Window start hour (UTC)")
+    end_hour: int = Field(..., ge=0, le=23, description="Window end hour (UTC)")
+    description: Optional[str] = None
+
+
+class ReleaseWindowResponse(BaseModel):
+    id: int
+    environment: str
+    day_of_week: list[int]
+    start_hour: int
+    end_hour: int
+    description: Optional[str]
+    created_at: str
+
+
+class WindowCheckResponse(BaseModel):
+    environment: str
+    in_window: bool
+    current_day: int
+    current_hour: int
+    matching_window: Optional[ReleaseWindowResponse]
+    message: str
+
+
+# ── Check Item Assignments ───────────────────────────────────────────────
+
+class AssignmentCreate(BaseModel):
+    assignee_email: str = Field(min_length=1, max_length=120, description="Assignee email")
+    due_at: Optional[str] = Field(None, description="Due date in ISO format")
+
+
+class AssignmentResponse(BaseModel):
+    id: int
+    item_id: int
+    checklist_id: int
+    title: str
+    category: str
+    assignee_email: str
+    due_at: Optional[str]
+    status: str
+    is_overdue: bool
+    created_at: str
+
+
+# ── Release Comparison ───────────────────────────────────────────────────
+
+class CategoryDiff(BaseModel):
+    category: str
+    checklist_a_passed: int
+    checklist_a_total: int
+    checklist_b_passed: int
+    checklist_b_total: int
+
+
+class ReleaseComparison(BaseModel):
+    checklist_a: ChecklistResponse
+    checklist_b: ChecklistResponse
+    score_diff: int
+    status_diff: dict
+    category_breakdown: list[CategoryDiff]
+    common_failures: list[str]
+    unique_to_a: list[str]
+    unique_to_b: list[str]
