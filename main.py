@@ -21,6 +21,14 @@ from models import (
     LabelAddRequest, LabelResponse,
     WatcherAddRequest, WatcherResponse,
     ReleaseVelocity,
+    # v1.0.0: Release Approvals
+    ApprovalGateCreate, ApprovalGateResponse,
+    GateDecision, GateDecisionResponse, AllGatesStatus,
+    # v1.0.0: Automation Rules
+    AutomationRuleCreate, AutomationRuleUpdate, AutomationRuleResponse,
+    # v1.0.0: Release Calendar
+    ReleaseEventCreate, ReleaseEventUpdate, ReleaseEventResponse,
+    CalendarConflict, CalendarView,
 )
 from engine import (
     init_db, create_checklist, list_checklists, get_checklist, delete_checklist,
@@ -42,6 +50,18 @@ from engine import (
     add_watcher, list_watchers, remove_watcher, get_watcher_checklists,
     get_release_velocity,
     VALID_LABELS,
+    # v1.0.0: Release Approvals
+    create_approval_gate, list_approval_gates, get_approval_gate,
+    approve_or_reject_gate, check_all_gates_approved, get_gates_status,
+    # v1.0.0: Automation Rules
+    create_automation_rule, list_automation_rules, update_automation_rule,
+    delete_automation_rule, evaluate_automation_rules,
+    VALID_RULE_TYPES,
+    # v1.0.0: Release Calendar
+    create_release_event, list_release_events, get_release_event,
+    update_release_event, delete_release_event,
+    detect_conflicts, get_calendar_view,
+    VALID_EVENT_STATUSES,
 )
 
 DB_PATH = os.getenv("DB_PATH", "releaseready.db")
@@ -64,9 +84,12 @@ app = FastAPI(
         "release windows (allowed deploy times), check item assignments with due dates, "
         "side-by-side release comparison, "
         "release labels for categorization, checklist watchers, "
-        "and release velocity dashboard with bottleneck analytics."
+        "release velocity dashboard with bottleneck analytics, "
+        "multi-level approval gates with role-based quorum, "
+        "checklist automation rules for automatic status updates, "
+        "and release calendar with conflict detection."
     ),
-    version="0.9.0",
+    version="1.0.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -74,7 +97,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.9.0"}
+    return {"status": "ok", "version": "1.0.0"}
 
 
 # ── Release Windows ──────────────────────────────────────────────────────
@@ -328,6 +351,8 @@ async def complete(checklist_id: int):
         raise HTTPException(422, "Cannot complete: at least one sign-off is required")
     if result == "blocking_failures":
         raise HTTPException(422, "Cannot complete: blocking check failures exist")
+    if result == "gates_not_approved":
+        raise HTTPException(422, "Cannot complete: not all approval gates are approved")
     return result
 
 
@@ -530,3 +555,204 @@ async def release_velocity(
     """Release velocity dashboard: completion rate, average duration, bottleneck categories,
     fastest/slowest releases, and breakdowns by service and environment."""
     return await get_release_velocity(app.state.db, days)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Feature 1: Release Approvals (v1.0.0)
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.post("/checklists/{checklist_id}/gates", response_model=ApprovalGateResponse, status_code=201)
+async def create_gate(checklist_id: int, body: ApprovalGateCreate):
+    """Create an approval gate for a release checklist."""
+    result = await create_approval_gate(app.state.db, checklist_id, body.model_dump())
+    if result is None:
+        raise HTTPException(404, "Checklist not found")
+    return result
+
+
+@app.get("/checklists/{checklist_id}/gates", response_model=list[ApprovalGateResponse])
+async def get_checklist_gates(checklist_id: int):
+    """List all approval gates for a checklist."""
+    c = await get_checklist(app.state.db, checklist_id)
+    if not c:
+        raise HTTPException(404, "Checklist not found")
+    return await list_approval_gates(app.state.db, checklist_id)
+
+
+@app.get("/gates/{gate_id}", response_model=ApprovalGateResponse)
+async def get_gate(gate_id: int):
+    """Get a single approval gate with its decisions."""
+    result = await get_approval_gate(app.state.db, gate_id)
+    if not result:
+        raise HTTPException(404, "Approval gate not found")
+    return result
+
+
+@app.post("/gates/{gate_id}/decide", response_model=GateDecisionResponse, status_code=201)
+async def decide_gate(gate_id: int, body: GateDecision):
+    """Submit an approval or rejection decision for a gate."""
+    result = await approve_or_reject_gate(app.state.db, gate_id, body.model_dump())
+    if result is None:
+        raise HTTPException(404, "Approval gate not found")
+    if result == "invalid_role":
+        raise HTTPException(
+            422,
+            f"Role '{body.approver_role}' is not in the gate's required_roles",
+        )
+    if result == "duplicate":
+        raise HTTPException(
+            409,
+            f"'{body.approver_email}' has already submitted a decision for this gate",
+        )
+    if result == "gate_already_resolved":
+        raise HTTPException(409, "This gate has already been approved or rejected")
+    return result
+
+
+@app.get("/checklists/{checklist_id}/gates/status", response_model=AllGatesStatus)
+async def gates_status(checklist_id: int):
+    """Check whether all approval gates for a checklist are approved."""
+    c = await get_checklist(app.state.db, checklist_id)
+    if not c:
+        raise HTTPException(404, "Checklist not found")
+    return await get_gates_status(app.state.db, checklist_id)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Feature 2: Checklist Automation Rules (v1.0.0)
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.post("/checklists/{checklist_id}/automations", response_model=AutomationRuleResponse, status_code=201)
+async def create_automation(checklist_id: int, body: AutomationRuleCreate):
+    """Create an automation rule for a check item in a checklist."""
+    result = await create_automation_rule(app.state.db, checklist_id, body.model_dump())
+    if result is None:
+        raise HTTPException(404, "Checklist not found")
+    if result == "invalid_rule_type":
+        raise HTTPException(
+            422,
+            f"Invalid rule_type '{body.rule_type}'. Valid types: {sorted(VALID_RULE_TYPES)}",
+        )
+    if result == "item_not_in_checklist":
+        raise HTTPException(
+            422,
+            f"Check item {body.item_id} does not belong to checklist {checklist_id}",
+        )
+    return result
+
+
+@app.get("/checklists/{checklist_id}/automations", response_model=list[AutomationRuleResponse])
+async def get_automations(checklist_id: int):
+    """List all automation rules for a checklist."""
+    c = await get_checklist(app.state.db, checklist_id)
+    if not c:
+        raise HTTPException(404, "Checklist not found")
+    return await list_automation_rules(app.state.db, checklist_id)
+
+
+@app.patch("/automations/{rule_id}", response_model=AutomationRuleResponse)
+async def patch_automation(rule_id: int, body: AutomationRuleUpdate):
+    """Update an automation rule's condition or enabled state."""
+    result = await update_automation_rule(app.state.db, rule_id, body.model_dump(exclude_none=True))
+    if result is None:
+        raise HTTPException(404, "Automation rule not found")
+    return result
+
+
+@app.delete("/automations/{rule_id}", status_code=204)
+async def remove_automation(rule_id: int):
+    """Delete an automation rule."""
+    if not await delete_automation_rule(app.state.db, rule_id):
+        raise HTTPException(404, "Automation rule not found")
+
+
+@app.post("/checklists/{checklist_id}/automations/evaluate")
+async def evaluate_automations(checklist_id: int):
+    """Evaluate all enabled automation rules for a checklist and apply actions."""
+    c = await get_checklist(app.state.db, checklist_id)
+    if not c:
+        raise HTTPException(404, "Checklist not found")
+    return await evaluate_automation_rules(app.state.db, checklist_id)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Feature 3: Release Calendar (v1.0.0)
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.post("/calendar/events", response_model=ReleaseEventResponse, status_code=201)
+async def create_event(body: ReleaseEventCreate):
+    """Schedule a release event on the calendar."""
+    result = await create_release_event(app.state.db, body.model_dump())
+    if result == "invalid_checklist":
+        raise HTTPException(404, "Associated checklist not found")
+    return result
+
+
+@app.get("/calendar/events", response_model=list[ReleaseEventResponse])
+async def get_events(
+    environment: str | None = Query(None, description="Filter by environment"),
+    status: str | None = Query(None, description="Filter by status: planned | confirmed | in_progress | completed | cancelled"),
+    from_date: str | None = Query(None, alias="from", description="Start of date range (ISO format)"),
+    to_date: str | None = Query(None, alias="to", description="End of date range (ISO format)"),
+):
+    """List release calendar events with optional filters."""
+    return await list_release_events(
+        app.state.db, environment=environment, status=status,
+        from_date=from_date, to_date=to_date,
+    )
+
+
+@app.get("/calendar/events/{event_id}", response_model=ReleaseEventResponse)
+async def get_event(event_id: int):
+    """Get a single release calendar event."""
+    result = await get_release_event(app.state.db, event_id)
+    if not result:
+        raise HTTPException(404, "Release event not found")
+    return result
+
+
+@app.patch("/calendar/events/{event_id}", response_model=ReleaseEventResponse)
+async def patch_event(event_id: int, body: ReleaseEventUpdate):
+    """Update a release calendar event."""
+    result = await update_release_event(app.state.db, event_id, body.model_dump(exclude_none=True))
+    if result is None:
+        raise HTTPException(404, "Release event not found")
+    if result == "invalid_status":
+        raise HTTPException(
+            422,
+            f"Invalid status. Valid statuses: {sorted(VALID_EVENT_STATUSES)}",
+        )
+    return result
+
+
+@app.delete("/calendar/events/{event_id}", status_code=204)
+async def remove_event(event_id: int):
+    """Delete a release calendar event."""
+    if not await delete_release_event(app.state.db, event_id):
+        raise HTTPException(404, "Release event not found")
+
+
+@app.get("/calendar/conflicts", response_model=list[CalendarConflict])
+async def calendar_conflicts(
+    environment: str | None = Query(None, description="Filter by environment"),
+    from_date: str | None = Query(None, alias="from", description="Start of date range (ISO format)"),
+    to_date: str | None = Query(None, alias="to", description="End of date range (ISO format)"),
+):
+    """Detect scheduling conflicts (overlapping events in the same environment)."""
+    return await detect_conflicts(
+        app.state.db, environment=environment,
+        from_date=from_date, to_date=to_date,
+    )
+
+
+@app.get("/calendar/view", response_model=CalendarView)
+async def calendar_view(
+    from_date: str = Query(..., alias="from", description="Start of date range (ISO format)"),
+    to_date: str = Query(..., alias="to", description="End of date range (ISO format)"),
+    environment: str | None = Query(None, description="Filter by environment"),
+):
+    """Full calendar view with events, conflicts, and statistics."""
+    return await get_calendar_view(
+        app.state.db, from_date=from_date, to_date=to_date,
+        environment=environment,
+    )
