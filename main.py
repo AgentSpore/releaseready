@@ -15,6 +15,9 @@ from models import (
     TemplateCreate, TemplateResponse, TemplateItemCreate,
     ReleaseTimeline, ServiceReleases, RiskAssessment,
     CommentCreate, CommentResponse, PromoteRequest,
+    ReleaseWindowCreate, ReleaseWindowResponse, WindowCheckResponse,
+    AssignmentCreate, AssignmentResponse,
+    ReleaseComparison,
 )
 from engine import (
     init_db, create_checklist, list_checklists, get_checklist, delete_checklist,
@@ -27,6 +30,10 @@ from engine import (
     get_release_timeline, get_service_releases, get_risk_assessment,
     add_comment, list_comments, delete_comment,
     promote_checklist, export_checklist_csv,
+    create_release_window, list_release_windows, delete_release_window,
+    check_in_release_window,
+    assign_check_item, list_assignments, get_overdue_assignments,
+    compare_releases,
 )
 
 DB_PATH = os.getenv("DB_PATH", "releaseready.db")
@@ -45,9 +52,11 @@ app = FastAPI(
         "Production release readiness checklist with templates, check dependencies, "
         "sign-off workflow, rollback playbooks, deployment gates, "
         "release timeline, service release cadence, automated risk assessment, "
-        "checklist comments, environment promotion, and CSV export."
+        "checklist comments, environment promotion, CSV export, "
+        "release windows (allowed deploy times), check item assignments with due dates, "
+        "and side-by-side release comparison."
     ),
-    version="0.7.0",
+    version="0.8.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -55,7 +64,36 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.7.0"}
+    return {"status": "ok", "version": "0.8.0"}
+
+
+# ── Release Windows ──────────────────────────────────────────────────────
+
+@app.post("/release-windows", response_model=ReleaseWindowResponse, status_code=201)
+async def create_window(body: ReleaseWindowCreate):
+    """Define an allowed release window for an environment."""
+    return await create_release_window(app.state.db, body.model_dump())
+
+
+@app.get("/release-windows", response_model=list[ReleaseWindowResponse])
+async def get_windows(
+    environment: str | None = Query(None, description="Filter by environment"),
+):
+    return await list_release_windows(app.state.db, environment)
+
+
+@app.delete("/release-windows/{window_id}", status_code=204)
+async def remove_window(window_id: int):
+    if not await delete_release_window(app.state.db, window_id):
+        raise HTTPException(404, "Release window not found")
+
+
+@app.get("/release-windows/check", response_model=WindowCheckResponse)
+async def check_window(
+    environment: str = Query(..., description="Environment to check"),
+):
+    """Check if current UTC time falls within a release window for the given environment."""
+    return await check_in_release_window(app.state.db, environment)
 
 
 # ── Templates ─────────────────────────────────────────────────────────────
@@ -120,6 +158,18 @@ async def aggregate_stats():
     return await get_aggregate_stats(app.state.db)
 
 
+@app.get("/checklists/compare", response_model=ReleaseComparison)
+async def compare_checklists(
+    a: int = Query(..., description="First checklist ID"),
+    b: int = Query(..., description="Second checklist ID"),
+):
+    """Compare two release checklists side by side."""
+    result = await compare_releases(app.state.db, a, b)
+    if not result:
+        raise HTTPException(404, "One or both checklists not found")
+    return result
+
+
 @app.get("/checklists", response_model=list[ChecklistResponse])
 async def list_all(
     environment: str | None = Query(None, description="staging | production | canary"),
@@ -160,7 +210,7 @@ async def clone(
 
 @app.post("/checklists/{checklist_id}/promote", response_model=ChecklistResponse, status_code=201)
 async def promote(checklist_id: int, body: PromoteRequest):
-    """Promote a checklist to a different environment (e.g. staging → production).
+    """Promote a checklist to a different environment (e.g. staging -> production).
     Passed checks carry over; failed/pending items reset to pending."""
     result = await promote_checklist(
         app.state.db, checklist_id,
@@ -177,7 +227,7 @@ async def promote(checklist_id: int, body: PromoteRequest):
 
 @app.get("/checklists/{checklist_id}/export/csv")
 async def export_csv(checklist_id: int):
-    """Export checklist items and sign-offs as CSV for audit/compliance."""
+    """Export checklist items, assignments, and sign-offs as CSV for audit/compliance."""
     data = await export_checklist_csv(app.state.db, checklist_id)
     if data is None:
         raise HTTPException(404, "Checklist not found")
@@ -202,7 +252,7 @@ async def timeline(checklist_id: int):
 
 @app.get("/checklists/{checklist_id}/risk", response_model=RiskAssessment)
 async def risk_assessment(checklist_id: int):
-    """Automated risk scoring based on check failures, environment, and configuration."""
+    """Automated risk scoring based on check failures, environment, release window, and configuration."""
     result = await get_risk_assessment(app.state.db, checklist_id)
     if not result:
         raise HTTPException(404, "Checklist not found")
@@ -309,6 +359,38 @@ async def update_item(item_id: int, body: CheckItemUpdate):
     if isinstance(result, str):
         raise HTTPException(422, result)
     return result
+
+
+# ── Check Item Assignments ───────────────────────────────────────────────
+
+@app.post("/items/{item_id}/assign", response_model=AssignmentResponse, status_code=201)
+async def assign_item(item_id: int, body: AssignmentCreate):
+    """Assign a check item to a team member with optional due date."""
+    result = await assign_check_item(app.state.db, item_id, body.model_dump())
+    if result is None:
+        raise HTTPException(404, "Check item not found")
+    return result
+
+
+@app.get("/checklists/{checklist_id}/assignments", response_model=list[AssignmentResponse])
+async def checklist_assignments(
+    checklist_id: int,
+    assignee: str | None = Query(None, description="Filter by assignee email"),
+):
+    """List all assignments for a checklist, optionally filtered by assignee."""
+    c = await get_checklist(app.state.db, checklist_id)
+    if not c:
+        raise HTTPException(404, "Checklist not found")
+    return await list_assignments(app.state.db, checklist_id, assignee)
+
+
+@app.get("/checklists/{checklist_id}/overdue", response_model=list[AssignmentResponse])
+async def overdue_assignments(checklist_id: int):
+    """List overdue assignments (past due_at and still pending)."""
+    c = await get_checklist(app.state.db, checklist_id)
+    if not c:
+        raise HTTPException(404, "Checklist not found")
+    return await get_overdue_assignments(app.state.db, checklist_id)
 
 
 # ── Rollback Plans ────────────────────────────────────────────────────────
