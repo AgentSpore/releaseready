@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS check_items (
     notes TEXT,
     checked_at TEXT,
     checked_by TEXT,
+    depends_on INTEGER,
     FOREIGN KEY (checklist_id) REFERENCES checklists(id)
 );
 
@@ -52,6 +53,23 @@ CREATE TABLE IF NOT EXISTS sign_offs (
     comment TEXT,
     signed_at TEXT NOT NULL,
     FOREIGN KEY (checklist_id) REFERENCES checklists(id)
+);
+
+CREATE TABLE IF NOT EXISTS templates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS template_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id INTEGER NOT NULL,
+    category TEXT NOT NULL DEFAULT 'general',
+    title TEXT NOT NULL,
+    description TEXT,
+    is_blocking INTEGER NOT NULL DEFAULT 1,
+    FOREIGN KEY (template_id) REFERENCES templates(id) ON DELETE CASCADE
 );
 """
 
@@ -78,6 +96,11 @@ async def init_db(path: str) -> aiosqlite.Connection:
     db = await aiosqlite.connect(path)
     db.row_factory = aiosqlite.Row
     await db.executescript(SQL)
+    # Migration: add depends_on column if missing
+    try:
+        await db.execute("SELECT depends_on FROM check_items LIMIT 1")
+    except Exception:
+        await db.execute("ALTER TABLE check_items ADD COLUMN depends_on INTEGER")
     await db.commit()
     return db
 
@@ -106,6 +129,7 @@ def _item_row(r: aiosqlite.Row) -> dict:
         "is_blocking": bool(r["is_blocking"]),
         "owner_email": r["owner_email"], "notes": r["notes"],
         "checked_at": r["checked_at"], "checked_by": r["checked_by"],
+        "depends_on": r["depends_on"],
     }
 
 
@@ -130,6 +154,93 @@ async def _compute_stats(db: aiosqlite.Connection, checklist_id: int) -> dict:
             "blocking_failures": blocking_failures, "pending": pending, "score": score}
 
 
+# ── Templates ─────────────────────────────────────────────────────────────
+
+async def create_template(db: aiosqlite.Connection, data: dict) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        "INSERT INTO templates (name, description, created_at) VALUES (?, ?, ?)",
+        (data["name"], data.get("description"), now),
+    )
+    template_id = cur.lastrowid
+    from_id = data.get("from_checklist_id")
+    if from_id:
+        items = await db.execute_fetchall(
+            "SELECT category, title, description, is_blocking FROM check_items WHERE checklist_id = ? ORDER BY id",
+            (from_id,),
+        )
+        for item in items:
+            await db.execute(
+                "INSERT INTO template_items (template_id, category, title, description, is_blocking) VALUES (?,?,?,?,?)",
+                (template_id, item["category"], item["title"], item["description"], item["is_blocking"]),
+            )
+    else:
+        for category, title, is_blocking in DEFAULT_CHECKS:
+            await db.execute(
+                "INSERT INTO template_items (template_id, category, title, is_blocking) VALUES (?,?,?,?)",
+                (template_id, category, title, int(is_blocking)),
+            )
+    await db.commit()
+    return await get_template(db, template_id)
+
+
+async def list_templates(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM templates ORDER BY created_at DESC")
+    result = []
+    for r in rows:
+        cnt = await db.execute_fetchall(
+            "SELECT COUNT(*) as c FROM template_items WHERE template_id = ?", (r["id"],))
+        result.append({
+            "id": r["id"], "name": r["name"], "description": r["description"],
+            "check_count": cnt[0]["c"], "created_at": r["created_at"],
+        })
+    return result
+
+
+async def get_template(db: aiosqlite.Connection, template_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM templates WHERE id = ?", (template_id,))
+    if not rows:
+        return None
+    r = rows[0]
+    cnt = await db.execute_fetchall(
+        "SELECT COUNT(*) as c FROM template_items WHERE template_id = ?", (template_id,))
+    return {
+        "id": r["id"], "name": r["name"], "description": r["description"],
+        "check_count": cnt[0]["c"], "created_at": r["created_at"],
+    }
+
+
+async def get_template_items(db: aiosqlite.Connection, template_id: int) -> list[dict]:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM template_items WHERE template_id = ? ORDER BY id", (template_id,))
+    return [{"id": r["id"], "category": r["category"], "title": r["title"],
+             "description": r["description"], "is_blocking": bool(r["is_blocking"])} for r in rows]
+
+
+async def add_template_item(db: aiosqlite.Connection, template_id: int, data: dict) -> dict | None:
+    tmpl = await get_template(db, template_id)
+    if not tmpl:
+        return None
+    cur = await db.execute(
+        "INSERT INTO template_items (template_id, category, title, description, is_blocking) VALUES (?,?,?,?,?)",
+        (template_id, data["category"], data["title"], data.get("description"), int(data.get("is_blocking", True))),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM template_items WHERE id = ?", (cur.lastrowid,))
+    r = rows[0]
+    return {"id": r["id"], "category": r["category"], "title": r["title"],
+            "description": r["description"], "is_blocking": bool(r["is_blocking"])}
+
+
+async def delete_template(db: aiosqlite.Connection, template_id: int) -> bool:
+    await db.execute("DELETE FROM template_items WHERE template_id = ?", (template_id,))
+    cur = await db.execute("DELETE FROM templates WHERE id = ?", (template_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+# ── Checklists ────────────────────────────────────────────────────────────
+
 async def create_checklist(db: aiosqlite.Connection, data: dict) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     cur = await db.execute(
@@ -139,11 +250,31 @@ async def create_checklist(db: aiosqlite.Connection, data: dict) -> dict:
          data.get("owner_email"), data.get("description"), now)
     )
     checklist_id = cur.lastrowid
-    for category, title, is_blocking in DEFAULT_CHECKS:
-        await db.execute(
-            "INSERT INTO check_items (checklist_id, category, title, is_blocking) VALUES (?, ?, ?, ?)",
-            (checklist_id, category, title, int(is_blocking))
+    template_id = data.get("template_id")
+    if template_id:
+        items = await db.execute_fetchall(
+            "SELECT category, title, description, is_blocking FROM template_items WHERE template_id = ? ORDER BY id",
+            (template_id,),
         )
+        if not items:
+            # Fallback to defaults if template empty or not found
+            for category, title, is_blocking in DEFAULT_CHECKS:
+                await db.execute(
+                    "INSERT INTO check_items (checklist_id, category, title, is_blocking) VALUES (?, ?, ?, ?)",
+                    (checklist_id, category, title, int(is_blocking))
+                )
+        else:
+            for item in items:
+                await db.execute(
+                    "INSERT INTO check_items (checklist_id, category, title, description, is_blocking) VALUES (?,?,?,?,?)",
+                    (checklist_id, item["category"], item["title"], item["description"], item["is_blocking"]),
+                )
+    else:
+        for category, title, is_blocking in DEFAULT_CHECKS:
+            await db.execute(
+                "INSERT INTO check_items (checklist_id, category, title, is_blocking) VALUES (?, ?, ?, ?)",
+                (checklist_id, category, title, int(is_blocking))
+            )
     await db.commit()
     rows = await db.execute_fetchall("SELECT * FROM checklists WHERE id = ?", (checklist_id,))
     stats = await _compute_stats(db, checklist_id)
@@ -192,8 +323,29 @@ async def list_check_items(db: aiosqlite.Connection, checklist_id: int) -> list[
     return [_item_row(r) for r in rows]
 
 
+async def _check_dependency(db: aiosqlite.Connection, item_id: int) -> str | None:
+    """Check if item has an unmet dependency. Returns error message or None."""
+    rows = await db.execute_fetchall("SELECT depends_on FROM check_items WHERE id = ?", (item_id,))
+    if not rows or not rows[0]["depends_on"]:
+        return None
+    dep_id = rows[0]["depends_on"]
+    dep_rows = await db.execute_fetchall("SELECT status, title FROM check_items WHERE id = ?", (dep_id,))
+    if not dep_rows:
+        return None
+    if dep_rows[0]["status"] != "pass":
+        return f"Dependency not met: '{dep_rows[0]['title']}' (item #{dep_id}) must pass first"
+    return None
+
+
 async def update_check_item(db: aiosqlite.Connection, item_id: int,
-                             status: str, notes: str | None, checked_by: str | None) -> dict | None:
+                             status: str, notes: str | None, checked_by: str | None) -> dict | str | None:
+    rows = await db.execute_fetchall("SELECT * FROM check_items WHERE id = ?", (item_id,))
+    if not rows:
+        return None
+    if status == "pass":
+        dep_err = await _check_dependency(db, item_id)
+        if dep_err:
+            return dep_err
     now = datetime.now(timezone.utc).isoformat()
     await db.execute(
         "UPDATE check_items SET status=?, notes=?, checked_by=?, checked_at=? WHERE id=?",
@@ -206,10 +358,10 @@ async def update_check_item(db: aiosqlite.Connection, item_id: int,
 
 async def add_check_item(db: aiosqlite.Connection, data: dict) -> dict:
     cur = await db.execute(
-        """INSERT INTO check_items (checklist_id, category, title, description, is_blocking, owner_email)
-           VALUES (?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO check_items (checklist_id, category, title, description, is_blocking, owner_email, depends_on)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (data["checklist_id"], data["category"], data["title"], data.get("description"),
-         int(data.get("is_blocking", True)), data.get("owner_email"))
+         int(data.get("is_blocking", True)), data.get("owner_email"), data.get("depends_on"))
     )
     await db.commit()
     rows = await db.execute_fetchall("SELECT * FROM check_items WHERE id = ?", (cur.lastrowid,))
@@ -386,10 +538,10 @@ async def clone_checklist(db: aiosqlite.Connection, checklist_id: int,
     )
     for item in src_items:
         await db.execute(
-            """INSERT INTO check_items (checklist_id, category, title, description, is_blocking, owner_email)
-               VALUES (?,?,?,?,?,?)""",
+            """INSERT INTO check_items (checklist_id, category, title, description, is_blocking, owner_email, depends_on)
+               VALUES (?,?,?,?,?,?,?)""",
             (new_id, item["category"], item["title"], item["description"],
-             item["is_blocking"], item["owner_email"])
+             item["is_blocking"], item["owner_email"], None)
         )
     await db.commit()
     rows = await db.execute_fetchall("SELECT * FROM checklists WHERE id=?", (new_id,))
@@ -402,6 +554,7 @@ async def bulk_update_items(db: aiosqlite.Connection, checklist_id: int,
     now = datetime.now(timezone.utc).isoformat()
     updated = []
     not_found = []
+    dep_blocked = []
     for u in updates:
         item_id = u["item_id"]
         rows = await db.execute_fetchall(
@@ -410,10 +563,16 @@ async def bulk_update_items(db: aiosqlite.Connection, checklist_id: int,
         if not rows:
             not_found.append(item_id)
             continue
+        if u["status"] == "pass":
+            dep_err = await _check_dependency(db, item_id)
+            if dep_err:
+                dep_blocked.append({"item_id": item_id, "reason": dep_err})
+                continue
         await db.execute(
             "UPDATE check_items SET status=?, notes=?, checked_by=?, checked_at=? WHERE id=?",
             (u["status"], u.get("notes"), u.get("checked_by"), now, item_id)
         )
         updated.append(item_id)
     await db.commit()
-    return {"updated": len(updated), "not_found": not_found, "updated_ids": updated}
+    return {"updated": len(updated), "not_found": not_found, "updated_ids": updated,
+            "dependency_blocked": dep_blocked}
