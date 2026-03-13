@@ -1,4 +1,6 @@
 from __future__ import annotations
+import csv
+import io
 import json
 from datetime import datetime, timezone
 from collections import Counter
@@ -71,6 +73,17 @@ CREATE TABLE IF NOT EXISTS template_items (
     is_blocking INTEGER NOT NULL DEFAULT 1,
     FOREIGN KEY (template_id) REFERENCES templates(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS checklist_comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    checklist_id INTEGER NOT NULL,
+    author TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (checklist_id) REFERENCES checklists(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_comments_checklist ON checklist_comments(checklist_id);
 """
 
 DEFAULT_CHECKS = [
@@ -105,7 +118,7 @@ async def init_db(path: str) -> aiosqlite.Connection:
     return db
 
 
-def _checklist_row(r: aiosqlite.Row, stats: dict) -> dict:
+def _checklist_row(r: aiosqlite.Row, stats: dict, comment_count: int = 0) -> dict:
     return {
         "id": r["id"], "name": r["name"], "service": r["service"],
         "version": r["version"], "environment": r["environment"],
@@ -116,6 +129,7 @@ def _checklist_row(r: aiosqlite.Row, stats: dict) -> dict:
         "passed_checks": stats.get("passed", 0),
         "failed_checks": stats.get("failed", 0),
         "blocked_checks": stats.get("blocking_failures", 0),
+        "comment_count": comment_count,
         "created_at": r["created_at"],
         "completed_at": r["completed_at"] if "completed_at" in r.keys() else None,
     }
@@ -152,6 +166,12 @@ async def _compute_stats(db: aiosqlite.Connection, checklist_id: int) -> dict:
     score = round(passed / total * 100) if total > 0 else 0
     return {"total": total, "passed": passed, "failed": failed,
             "blocking_failures": blocking_failures, "pending": pending, "score": score}
+
+
+async def _comment_count(db: aiosqlite.Connection, checklist_id: int) -> int:
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) as cnt FROM checklist_comments WHERE checklist_id = ?", (checklist_id,))
+    return rows[0]["cnt"] if rows else 0
 
 
 # ── Templates ─────────────────────────────────────────────────────────────
@@ -257,7 +277,6 @@ async def create_checklist(db: aiosqlite.Connection, data: dict) -> dict:
             (template_id,),
         )
         if not items:
-            # Fallback to defaults if template empty or not found
             for category, title, is_blocking in DEFAULT_CHECKS:
                 await db.execute(
                     "INSERT INTO check_items (checklist_id, category, title, is_blocking) VALUES (?, ?, ?, ?)",
@@ -278,7 +297,8 @@ async def create_checklist(db: aiosqlite.Connection, data: dict) -> dict:
     await db.commit()
     rows = await db.execute_fetchall("SELECT * FROM checklists WHERE id = ?", (checklist_id,))
     stats = await _compute_stats(db, checklist_id)
-    return _checklist_row(rows[0], stats)
+    cc = await _comment_count(db, checklist_id)
+    return _checklist_row(rows[0], stats, cc)
 
 
 async def list_checklists(db: aiosqlite.Connection, environment: str | None = None,
@@ -296,7 +316,8 @@ async def list_checklists(db: aiosqlite.Connection, environment: str | None = No
     result = []
     for r in rows:
         stats = await _compute_stats(db, r["id"])
-        result.append(_checklist_row(r, stats))
+        cc = await _comment_count(db, r["id"])
+        result.append(_checklist_row(r, stats, cc))
     return result
 
 
@@ -305,16 +326,18 @@ async def get_checklist(db: aiosqlite.Connection, checklist_id: int) -> dict | N
     if not rows:
         return None
     stats = await _compute_stats(db, checklist_id)
-    return _checklist_row(rows[0], stats)
+    cc = await _comment_count(db, checklist_id)
+    return _checklist_row(rows[0], stats, cc)
 
 
 async def delete_checklist(db: aiosqlite.Connection, checklist_id: int) -> bool:
-    cur = await db.execute("DELETE FROM sign_offs WHERE checklist_id = ?", (checklist_id,))
+    await db.execute("DELETE FROM checklist_comments WHERE checklist_id = ?", (checklist_id,))
+    await db.execute("DELETE FROM sign_offs WHERE checklist_id = ?", (checklist_id,))
     await db.execute("DELETE FROM check_items WHERE checklist_id = ?", (checklist_id,))
     await db.execute("DELETE FROM rollback_plans WHERE checklist_id = ?", (checklist_id,))
     await db.execute("DELETE FROM checklists WHERE id = ?", (checklist_id,))
     await db.commit()
-    return cur.rowcount >= 0
+    return True
 
 
 async def list_check_items(db: aiosqlite.Connection, checklist_id: int) -> list[dict]:
@@ -324,7 +347,6 @@ async def list_check_items(db: aiosqlite.Connection, checklist_id: int) -> list[
 
 
 async def _check_dependency(db: aiosqlite.Connection, item_id: int) -> str | None:
-    """Check if item has an unmet dependency. Returns error message or None."""
     rows = await db.execute_fetchall("SELECT depends_on FROM check_items WHERE id = ?", (item_id,))
     if not rows or not rows[0]["depends_on"]:
         return None
@@ -488,7 +510,8 @@ async def get_aggregate_stats(db: aiosqlite.Connection) -> dict:
     total = len(cl_rows)
     if total == 0:
         return {"total_releases": 0, "by_environment": {}, "by_status": {},
-                "avg_readiness_score": 0, "most_failed_checks": [], "services": []}
+                "avg_readiness_score": 0, "most_failed_checks": [], "services": [],
+                "total_comments": 0}
 
     by_env: Counter = Counter(r["environment"] for r in cl_rows)
     by_status: Counter = Counter(r["status"] for r in cl_rows)
@@ -509,6 +532,8 @@ async def get_aggregate_stats(db: aiosqlite.Connection) -> dict:
     )
     services = [{"service": r["service"], "releases": r["releases"], "last_release": r["last_release"]} for r in svc_rows]
 
+    total_comments = (await db.execute_fetchall("SELECT COUNT(*) as c FROM checklist_comments"))[0]["c"]
+
     return {
         "total_releases": total,
         "by_environment": dict(by_env),
@@ -516,6 +541,7 @@ async def get_aggregate_stats(db: aiosqlite.Connection) -> dict:
         "avg_readiness_score": avg_score,
         "most_failed_checks": most_failed,
         "services": services,
+        "total_comments": total_comments,
     }
 
 
@@ -544,9 +570,7 @@ async def clone_checklist(db: aiosqlite.Connection, checklist_id: int,
              item["is_blocking"], item["owner_email"], None)
         )
     await db.commit()
-    rows = await db.execute_fetchall("SELECT * FROM checklists WHERE id=?", (new_id,))
-    stats = await _compute_stats(db, new_id)
-    return _checklist_row(rows[0], stats)
+    return await get_checklist(db, new_id)
 
 
 async def bulk_update_items(db: aiosqlite.Connection, checklist_id: int,
@@ -576,22 +600,21 @@ async def bulk_update_items(db: aiosqlite.Connection, checklist_id: int,
     await db.commit()
     return {"updated": len(updated), "not_found": not_found, "updated_ids": updated,
             "dependency_blocked": dep_blocked}
-# Additional functions to append to releaseready engine.py for v0.6.0
+
+
+# ── Timeline ─────────────────────────────────────────────────────────────
 
 async def get_release_timeline(db: aiosqlite.Connection, checklist_id: int) -> dict | None:
-    """Get chronological timeline of all actions on a checklist."""
     cl = await get_checklist(db, checklist_id)
     if not cl:
         return None
     events = []
-    # Checklist creation
     events.append({
         "type": "checklist_created",
         "timestamp": cl["created_at"],
         "actor": cl.get("owner_email") or "system",
         "detail": f"Created release checklist '{cl['name']}' for {cl['service']} {cl['version']}",
     })
-    # Check item updates
     items = await db.execute_fetchall(
         "SELECT * FROM check_items WHERE checklist_id = ? AND checked_at IS NOT NULL ORDER BY checked_at ASC",
         (checklist_id,),
@@ -603,7 +626,6 @@ async def get_release_timeline(db: aiosqlite.Connection, checklist_id: int) -> d
             "actor": item["checked_by"] or "unknown",
             "detail": f"[{item['category']}] {item['title']}: {item['status']}" + (f" — {item['notes']}" if item["notes"] else ""),
         })
-    # Rollback plan
     rp_rows = await db.execute_fetchall(
         "SELECT * FROM rollback_plans WHERE checklist_id = ?", (checklist_id,))
     for rp in rp_rows:
@@ -613,7 +635,6 @@ async def get_release_timeline(db: aiosqlite.Connection, checklist_id: int) -> d
             "actor": "system",
             "detail": f"Rollback plan added ({rp['estimated_minutes']} min estimated)",
         })
-    # Sign-offs
     sign_offs = await db.execute_fetchall(
         "SELECT * FROM sign_offs WHERE checklist_id = ? ORDER BY signed_at ASC",
         (checklist_id,),
@@ -625,7 +646,18 @@ async def get_release_timeline(db: aiosqlite.Connection, checklist_id: int) -> d
             "actor": so["name"],
             "detail": f"Signed off as {so['role']}" + (f": {so['comment']}" if so["comment"] else ""),
         })
-    # Completion
+    # Include comments in timeline
+    comments = await db.execute_fetchall(
+        "SELECT * FROM checklist_comments WHERE checklist_id = ? ORDER BY created_at ASC",
+        (checklist_id,),
+    )
+    for c in comments:
+        events.append({
+            "type": "comment",
+            "timestamp": c["created_at"],
+            "actor": c["author"],
+            "detail": c["body"][:200],
+        })
     if cl.get("completed_at"):
         events.append({
             "type": "checklist_completed",
@@ -644,7 +676,6 @@ async def get_release_timeline(db: aiosqlite.Connection, checklist_id: int) -> d
 
 
 async def get_service_releases(db: aiosqlite.Connection, service: str, limit: int = 20) -> dict:
-    """Get release history for a specific service."""
     rows = await db.execute_fetchall(
         "SELECT * FROM checklists WHERE service = ? ORDER BY created_at DESC LIMIT ?",
         (service, limit),
@@ -677,7 +708,6 @@ async def get_service_releases(db: aiosqlite.Connection, service: str, limit: in
 
 
 async def get_risk_assessment(db: aiosqlite.Connection, checklist_id: int) -> dict | None:
-    """Automated risk scoring based on check failures, environment, history."""
     cl = await get_checklist(db, checklist_id)
     if not cl:
         return None
@@ -687,80 +717,53 @@ async def get_risk_assessment(db: aiosqlite.Connection, checklist_id: int) -> di
     risk_factors = []
     risk_score = 0
 
-    # Factor 1: Blocking failures
     if stats["blocking_failures"] > 0:
         risk_score += 30
         risk_factors.append({
-            "factor": "blocking_failures",
-            "severity": "critical",
-            "detail": f"{stats['blocking_failures']} blocking check(s) failed",
-            "impact": 30,
+            "factor": "blocking_failures", "severity": "critical",
+            "detail": f"{stats['blocking_failures']} blocking check(s) failed", "impact": 30,
         })
-
-    # Factor 2: Low readiness score
     if stats["score"] < 80:
         impact = min(25, (80 - stats["score"]))
         risk_score += impact
         risk_factors.append({
-            "factor": "low_readiness",
-            "severity": "high",
-            "detail": f"Readiness score {stats['score']}% (below 80% threshold)",
-            "impact": impact,
+            "factor": "low_readiness", "severity": "high",
+            "detail": f"Readiness score {stats['score']}% (below 80% threshold)", "impact": impact,
         })
-
-    # Factor 3: Production environment
     if cl["environment"] == "production":
         risk_score += 10
         risk_factors.append({
-            "factor": "production_environment",
-            "severity": "medium",
-            "detail": "Deploying to production increases risk",
-            "impact": 10,
+            "factor": "production_environment", "severity": "medium",
+            "detail": "Deploying to production increases risk", "impact": 10,
         })
-
-    # Factor 4: No rollback plan
     rp = await db.execute_fetchall(
         "SELECT id FROM rollback_plans WHERE checklist_id = ?", (checklist_id,))
     if not rp:
         risk_score += 15
         risk_factors.append({
-            "factor": "no_rollback_plan",
-            "severity": "high",
-            "detail": "No rollback plan documented",
-            "impact": 15,
+            "factor": "no_rollback_plan", "severity": "high",
+            "detail": "No rollback plan documented", "impact": 15,
         })
-
-    # Factor 5: No sign-offs
     so = await list_sign_offs(db, checklist_id)
     if not so:
         risk_score += 10
         risk_factors.append({
-            "factor": "no_sign_offs",
-            "severity": "medium",
-            "detail": "No approvals/sign-offs recorded",
-            "impact": 10,
+            "factor": "no_sign_offs", "severity": "medium",
+            "detail": "No approvals/sign-offs recorded", "impact": 10,
         })
-
-    # Factor 6: Pending checks
     if stats["pending"] > 0:
         impact = min(15, stats["pending"] * 3)
         risk_score += impact
         risk_factors.append({
-            "factor": "pending_checks",
-            "severity": "medium",
-            "detail": f"{stats['pending']} check(s) still pending",
-            "impact": impact,
+            "factor": "pending_checks", "severity": "medium",
+            "detail": f"{stats['pending']} check(s) still pending", "impact": impact,
         })
-
-    # Factor 7: Security failures
     security_fails = [i for i in items if i["category"] == "security" and i["status"] == "fail"]
     if security_fails:
         risk_score += 20
         risk_factors.append({
-            "factor": "security_failures",
-            "severity": "critical",
-            "detail": f"{len(security_fails)} security check(s) failed",
-            "impact": 20,
+            "factor": "security_failures", "severity": "critical",
+            "detail": f"{len(security_fails)} security check(s) failed", "impact": 20,
         })
 
     risk_score = min(risk_score, 100)
@@ -775,12 +778,118 @@ async def get_risk_assessment(db: aiosqlite.Connection, checklist_id: int) -> di
 
     return {
         "checklist_id": checklist_id,
-        "service": cl["service"],
-        "version": cl["version"],
+        "service": cl["service"], "version": cl["version"],
         "environment": cl["environment"],
-        "risk_score": risk_score,
-        "risk_level": level,
+        "risk_score": risk_score, "risk_level": level,
         "readiness_score": stats["score"],
-        "total_factors": len(risk_factors),
-        "factors": risk_factors,
+        "total_factors": len(risk_factors), "factors": risk_factors,
     }
+
+
+# ── Checklist Comments ───────────────────────────────────────────────────
+
+async def add_comment(db: aiosqlite.Connection, checklist_id: int, data: dict) -> dict | None:
+    cl = await db.execute_fetchall("SELECT id FROM checklists WHERE id = ?", (checklist_id,))
+    if not cl:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        "INSERT INTO checklist_comments (checklist_id, author, body, created_at) VALUES (?,?,?,?)",
+        (checklist_id, data["author"], data["body"], now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM checklist_comments WHERE id = ?", (cur.lastrowid,))
+    r = rows[0]
+    return {"id": r["id"], "checklist_id": r["checklist_id"],
+            "author": r["author"], "body": r["body"], "created_at": r["created_at"]}
+
+
+async def list_comments(db: aiosqlite.Connection, checklist_id: int) -> list[dict]:
+    rows = await db.execute_fetchall(
+        "SELECT * FROM checklist_comments WHERE checklist_id = ? ORDER BY created_at ASC",
+        (checklist_id,),
+    )
+    return [{"id": r["id"], "checklist_id": r["checklist_id"],
+             "author": r["author"], "body": r["body"], "created_at": r["created_at"]}
+            for r in rows]
+
+
+async def delete_comment(db: aiosqlite.Connection, comment_id: int) -> bool:
+    cur = await db.execute("DELETE FROM checklist_comments WHERE id = ?", (comment_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+# ── Environment Promotion ────────────────────────────────────────────────
+
+async def promote_checklist(db: aiosqlite.Connection, checklist_id: int,
+                             target_env: str, new_version: str | None = None,
+                             owner_email: str | None = None) -> dict | str | None:
+    src = await db.execute_fetchall("SELECT * FROM checklists WHERE id = ?", (checklist_id,))
+    if not src:
+        return None
+    s = src[0]
+    if s["environment"] == target_env:
+        return "same_environment"
+    now = datetime.now(timezone.utc).isoformat()
+    version = new_version or s["version"]
+    owner = owner_email or s["owner_email"]
+    name = f"{s['service']} {version} ({target_env})"
+    cur = await db.execute(
+        """INSERT INTO checklists (name, service, version, environment, owner_email, description, created_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        (name, s["service"], version, target_env, owner,
+         f"Promoted from {s['environment']} checklist #{checklist_id}", now)
+    )
+    new_id = cur.lastrowid
+    # Copy check items with their current status (pass items stay pass, fail reset to pending)
+    src_items = await db.execute_fetchall(
+        "SELECT * FROM check_items WHERE checklist_id = ? ORDER BY id", (checklist_id,))
+    for item in src_items:
+        carry_status = item["status"] if item["status"] == "pass" else "pending"
+        carry_at = item["checked_at"] if item["status"] == "pass" else None
+        carry_by = item["checked_by"] if item["status"] == "pass" else None
+        await db.execute(
+            """INSERT INTO check_items (checklist_id, category, title, description, is_blocking,
+               owner_email, notes, status, checked_at, checked_by)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (new_id, item["category"], item["title"], item["description"],
+             item["is_blocking"], item["owner_email"], item["notes"],
+             carry_status, carry_at, carry_by)
+        )
+    await db.commit()
+    return await get_checklist(db, new_id)
+
+
+# ── Checklist CSV Export ─────────────────────────────────────────────────
+
+async def export_checklist_csv(db: aiosqlite.Connection, checklist_id: int) -> str | None:
+    cl = await get_checklist(db, checklist_id)
+    if not cl:
+        return None
+    items = await list_check_items(db, checklist_id)
+    sign_offs = await list_sign_offs(db, checklist_id)
+
+    buf = io.StringIO()
+    # Header section
+    buf.write(f"# Release Checklist: {cl['name']}\n")
+    buf.write(f"# Service: {cl['service']} | Version: {cl['version']} | Env: {cl['environment']}\n")
+    buf.write(f"# Status: {cl['status']} | Score: {cl['readiness_score']}%\n")
+    buf.write(f"# Created: {cl['created_at']}\n\n")
+
+    fieldnames = ["id", "category", "title", "status", "is_blocking",
+                  "owner_email", "notes", "checked_by", "checked_at"]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    for item in items:
+        writer.writerow({k: item.get(k, "") for k in fieldnames})
+
+    if sign_offs:
+        buf.write("\n# Sign-Offs\n")
+        so_fields = ["name", "role", "comment", "signed_at"]
+        so_writer = csv.DictWriter(buf, fieldnames=so_fields)
+        so_writer.writeheader()
+        for so in sign_offs:
+            so_writer.writerow({k: so.get(k, "") for k in so_fields})
+
+    return buf.getvalue()
