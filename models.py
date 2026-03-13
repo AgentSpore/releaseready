@@ -142,3 +142,65 @@ class TemplateItemCreate(BaseModel):
     title: str
     description: Optional[str] = None
     is_blocking: bool = True
+
+
+# ── Timeline ─────────────────────────────────────────────────────────────
+
+class TimelineEvent(BaseModel):
+    type: str
+    timestamp: str
+    actor: str
+    detail: str
+
+
+class ReleaseTimeline(BaseModel):
+    checklist_id: int
+    service: str
+    version: str
+    total_events: int
+    events: list[TimelineEvent]
+
+
+# ── Service Releases ─────────────────────────────────────────────────────
+
+class ServiceReleaseEntry(BaseModel):
+    id: int
+    version: str
+    environment: str
+    status: str
+    readiness_score: int
+    total_checks: int
+    passed_checks: int
+    blocking_failures: int
+    created_at: str
+    completed_at: Optional[str]
+
+
+class ServiceReleases(BaseModel):
+    service: str
+    total_releases: int
+    completed: int
+    in_progress: int
+    avg_readiness_score: float
+    releases: list[ServiceReleaseEntry]
+
+
+# ── Risk Assessment ──────────────────────────────────────────────────────
+
+class RiskFactor(BaseModel):
+    factor: str
+    severity: str
+    detail: str
+    impact: int
+
+
+class RiskAssessment(BaseModel):
+    checklist_id: int
+    service: str
+    version: str
+    environment: str
+    risk_score: int
+    risk_level: str
+    readiness_score: int
+    total_factors: int
+    factors: list[RiskFactor]
