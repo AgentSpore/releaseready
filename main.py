@@ -18,6 +18,9 @@ from models import (
     ReleaseWindowCreate, ReleaseWindowResponse, WindowCheckResponse,
     AssignmentCreate, AssignmentResponse,
     ReleaseComparison,
+    LabelAddRequest, LabelResponse,
+    WatcherAddRequest, WatcherResponse,
+    ReleaseVelocity,
 )
 from engine import (
     init_db, create_checklist, list_checklists, get_checklist, delete_checklist,
@@ -34,6 +37,11 @@ from engine import (
     check_in_release_window,
     assign_check_item, list_assignments, get_overdue_assignments,
     compare_releases,
+    add_checklist_label, remove_checklist_label, list_checklist_labels,
+    list_checklists_by_label,
+    add_watcher, list_watchers, remove_watcher, get_watcher_checklists,
+    get_release_velocity,
+    VALID_LABELS,
 )
 
 DB_PATH = os.getenv("DB_PATH", "releaseready.db")
@@ -54,9 +62,11 @@ app = FastAPI(
         "release timeline, service release cadence, automated risk assessment, "
         "checklist comments, environment promotion, CSV export, "
         "release windows (allowed deploy times), check item assignments with due dates, "
-        "and side-by-side release comparison."
+        "side-by-side release comparison, "
+        "release labels for categorization, checklist watchers, "
+        "and release velocity dashboard with bottleneck analytics."
     ),
-    version="0.8.0",
+    version="0.9.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -64,7 +74,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.8.0"}
+    return {"status": "ok", "version": "0.9.0"}
 
 
 # ── Release Windows ──────────────────────────────────────────────────────
@@ -174,8 +184,9 @@ async def compare_checklists(
 async def list_all(
     environment: str | None = Query(None, description="staging | production | canary"),
     status: str | None = Query(None, description="in_progress | ready | blocked | completed"),
+    label: str | None = Query(None, description="Filter by label: critical | hotfix | minor | major | security | emergency | regression | planned"),
 ):
-    return await list_checklists(app.state.db, environment, status)
+    return await list_checklists(app.state.db, environment, status, label)
 
 
 @app.get("/checklists/{checklist_id}", response_model=ChecklistResponse)
@@ -423,3 +434,99 @@ async def service_releases(
 ):
     """Release history for a specific service with cadence metrics."""
     return await get_service_releases(app.state.db, service_name, limit)
+
+
+# ── Release Labels (v0.9.0) ───────────────────────────────────────────────
+
+@app.post("/checklists/{checklist_id}/labels", response_model=LabelResponse, status_code=201)
+async def add_label(checklist_id: int, body: LabelAddRequest):
+    """Attach a label to a checklist for categorization."""
+    result = await add_checklist_label(app.state.db, checklist_id, body.label)
+    if result is None:
+        raise HTTPException(404, "Checklist not found")
+    if result == "invalid_label":
+        raise HTTPException(
+            422,
+            f"Invalid label '{body.label}'. Valid labels: {sorted(VALID_LABELS)}",
+        )
+    if result == "duplicate":
+        raise HTTPException(409, f"Label '{body.label}' already applied to this checklist")
+    return result
+
+
+@app.delete("/checklists/{checklist_id}/labels/{label}", status_code=204)
+async def delete_label(checklist_id: int, label: str):
+    """Remove a label from a checklist."""
+    if not await remove_checklist_label(app.state.db, checklist_id, label):
+        raise HTTPException(404, "Label not found on this checklist")
+
+
+@app.get("/checklists/{checklist_id}/labels", response_model=list[LabelResponse])
+async def get_labels(checklist_id: int):
+    """List all labels on a checklist."""
+    c = await get_checklist(app.state.db, checklist_id)
+    if not c:
+        raise HTTPException(404, "Checklist not found")
+    return await list_checklist_labels(app.state.db, checklist_id)
+
+
+@app.get("/labels/{label}/checklists", response_model=list[ChecklistResponse])
+async def checklists_by_label(
+    label: str,
+    limit: int = Query(50, ge=1, le=200, description="Maximum number of results"),
+):
+    """List all checklists tagged with the given label."""
+    if label not in VALID_LABELS:
+        raise HTTPException(
+            422,
+            f"Invalid label '{label}'. Valid labels: {sorted(VALID_LABELS)}",
+        )
+    return await list_checklists_by_label(app.state.db, label, limit)
+
+
+# ── Checklist Watchers (v0.9.0) ───────────────────────────────────────────
+
+@app.post("/checklists/{checklist_id}/watchers", response_model=WatcherResponse, status_code=201)
+async def add_checklist_watcher(checklist_id: int, body: WatcherAddRequest):
+    """Subscribe a team member to a checklist."""
+    result = await add_watcher(app.state.db, checklist_id, body.email, body.name)
+    if result is None:
+        raise HTTPException(404, "Checklist not found")
+    if result == "duplicate":
+        raise HTTPException(409, f"'{body.email}' is already watching this checklist")
+    return result
+
+
+@app.get("/checklists/{checklist_id}/watchers", response_model=list[WatcherResponse])
+async def get_checklist_watchers(checklist_id: int):
+    """List all watchers of a checklist."""
+    c = await get_checklist(app.state.db, checklist_id)
+    if not c:
+        raise HTTPException(404, "Checklist not found")
+    return await list_watchers(app.state.db, checklist_id)
+
+
+@app.delete("/watchers/{watcher_id}", status_code=204)
+async def delete_watcher(watcher_id: int):
+    """Unsubscribe a watcher by their watcher record ID."""
+    if not await remove_watcher(app.state.db, watcher_id):
+        raise HTTPException(404, "Watcher not found")
+
+
+@app.get("/watchers/by-email", response_model=list[ChecklistResponse])
+async def checklists_by_watcher(
+    email: str = Query(..., description="Email address of the watcher"),
+):
+    """Return all checklists watched by the given email."""
+    return await get_watcher_checklists(app.state.db, email)
+
+
+# ── Release Velocity Dashboard (v0.9.0) ───────────────────────────────────
+
+@app.get("/analytics/velocity", response_model=ReleaseVelocity)
+async def release_velocity(
+    days: int = Query(30, ge=1, le=365, description="Rolling period in days (1-365)"),
+):
+    """Release velocity dashboard: completion rate, average duration, bottleneck categories,
+    fastest/slowest releases, and breakdowns by service and environment."""
+    return await get_release_velocity(app.state.db, days)
