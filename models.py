@@ -27,6 +27,7 @@ class ChecklistResponse(BaseModel):
     passed_checks: int
     failed_checks: int
     blocked_checks: int
+    comment_count: int
     created_at: str
     completed_at: Optional[str]
 
@@ -204,3 +205,26 @@ class RiskAssessment(BaseModel):
     readiness_score: int
     total_factors: int
     factors: list[RiskFactor]
+
+
+# ── Checklist Comments ───────────────────────────────────────────────────
+
+class CommentCreate(BaseModel):
+    author: str = Field(min_length=1, max_length=80, description="Comment author name or email")
+    body: str = Field(min_length=1, max_length=2000, description="Comment text")
+
+
+class CommentResponse(BaseModel):
+    id: int
+    checklist_id: int
+    author: str
+    body: str
+    created_at: str
+
+
+# ── Environment Promotion ────────────────────────────────────────────────
+
+class PromoteRequest(BaseModel):
+    target_environment: str = Field(..., description="Target environment: staging | production | canary")
+    new_version: Optional[str] = Field(None, description="Override version for promoted checklist")
+    owner_email: Optional[str] = Field(None, description="Override owner for promoted checklist")

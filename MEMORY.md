@@ -45,8 +45,16 @@
   7. security_failures (critical, +20)
   - Risk levels: low (<20), medium (20-39), high (40-59), critical (60+)
 
+### Cycle 7 (v0.7.0) — Collaboration & Compliance
+- **Checklist Comments**: Discussion comments on checklists (checklist_comments table with author, body, created_at). POST/GET /checklists/{id}/comments, DELETE /comments/{id}. Comments included in timeline events and comment_count tracked on checklist response.
+- **Environment Promotion**: Promote a checklist from one environment to another (e.g. staging to production). POST /checklists/{id}/promote with target_environment, optional new_version and owner_email. Passed checks carry over, failed/pending items reset to pending. Same-environment promotion returns 422.
+- **Checklist CSV Export**: Export checklist items and sign-offs as CSV for audit/compliance. GET /checklists/{id}/export/csv returns StreamingResponse with header section (name, service, version, env, status, score) followed by items table and sign-offs table.
+
 ## Technical Notes
-- Timeline aggregates from 4 tables (checklists, check_items, rollback_plans, sign_offs)
+- Timeline aggregates from 5 tables (checklists, check_items, rollback_plans, sign_offs, checklist_comments)
 - Risk score capped at 100, factors have individual impact weights
 - Service releases use _compute_stats() for per-checklist metrics
 - readiness_score auto-recalculated on every check item update
+- Aggregate stats include total_comments count
+- Promotion resets non-pass items to pending, carries pass items with their checked_at/checked_by
+- CSV export uses csv.DictWriter with io.StringIO buffer

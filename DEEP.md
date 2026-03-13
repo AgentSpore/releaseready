@@ -3,7 +3,8 @@
 ## Overview
 Production release readiness checklist with templates, check dependencies,
 sign-off workflow, rollback playbooks, deployment gates, release timeline,
-service release cadence, and automated risk assessment.
+service release cadence, automated risk assessment, checklist comments,
+environment promotion, and CSV export.
 
 ## Stack
 - **Runtime**: Python 3.11+ / FastAPI / uvicorn
@@ -39,7 +40,11 @@ Steps, estimated_minutes, trigger_conditions per checklist.
 ### sign_offs
 Name, role, comment, signed_at per checklist.
 
-## API Endpoints (v0.6.0) — 22 endpoints
+### checklist_comments (v0.7.0)
+Discussion comments on checklists. Fields: id, checklist_id, author, body, created_at.
+Indexed on checklist_id. ON DELETE CASCADE from checklists.
+
+## API Endpoints (v0.7.0) — 27 endpoints
 
 ### Templates
 - POST /templates — create (optionally from existing checklist)
@@ -57,8 +62,19 @@ Name, role, comment, signed_at per checklist.
 - DELETE /checklists/{id} — remove
 - POST /checklists/{id}/clone — clone with new version
 
+### Comments (v0.7.0)
+- POST /checklists/{id}/comments — add discussion comment
+- GET /checklists/{id}/comments — list comments
+- DELETE /comments/{id} — delete comment
+
+### Environment Promotion (v0.7.0)
+- POST /checklists/{id}/promote — promote to another environment (carries passed checks)
+
+### CSV Export (v0.7.0)
+- GET /checklists/{id}/export/csv — export items + sign-offs as CSV
+
 ### Timeline & Risk
-- GET /checklists/{id}/timeline — chronological event log
+- GET /checklists/{id}/timeline — chronological event log (includes comments)
 - GET /checklists/{id}/risk — automated risk assessment (7 factors)
 - GET /services/{name}/releases — release history with cadence metrics
 
@@ -78,7 +94,10 @@ Name, role, comment, signed_at per checklist.
 - GET /checklists/{id}/report — readiness report
 
 ## Key Features
-- **Release Timeline**: Chronological events (creation, checks, sign-offs, rollback plans, completion)
+- **Checklist Comments**: Discussion threads on checklists, included in timeline events, comment_count tracked on checklist response
+- **Environment Promotion**: Promote staging to production (or any env), passed checks carry over, failed/pending reset
+- **CSV Export**: Audit-compliant CSV with checklist header, items, and sign-offs sections
+- **Release Timeline**: Chronological events (creation, checks, sign-offs, rollback plans, comments, completion)
 - **Risk Assessment**: 7 factors (blocking failures, low readiness, production env, no rollback, no sign-offs, pending checks, security failures), scored 0-100 with level (low/medium/high/critical)
 - **Service Releases**: Release history per service with cadence metrics (avg score, completion rate)
 - **Templates**: Create from scratch or convert existing checklist
@@ -93,3 +112,4 @@ Name, role, comment, signed_at per checklist.
 - v0.4.0: Sign-off workflow, completion gates
 - v0.5.0: Check dependencies, aggregate stats, env/status filters
 - v0.6.0: Release timeline, service cadence, risk assessment
+- v0.7.0: Checklist comments, environment promotion, CSV export
