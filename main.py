@@ -11,6 +11,7 @@ from models import (
     RollbackPlanCreate, RollbackPlanResponse,
     ReadinessReport, BulkItemUpdate,
     SignOffCreate, SignOffResponse,
+    TemplateCreate, TemplateResponse, TemplateItemCreate,
 )
 from engine import (
     init_db, create_checklist, list_checklists, get_checklist, delete_checklist,
@@ -18,6 +19,8 @@ from engine import (
     create_rollback_plan, get_readiness_report, get_aggregate_stats,
     clone_checklist, bulk_update_items,
     add_sign_off, list_sign_offs, complete_checklist,
+    create_template, list_templates, get_template, get_template_items,
+    add_template_item, delete_template,
 )
 
 DB_PATH = os.getenv("DB_PATH", "releaseready.db")
@@ -32,8 +35,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ReleaseReady",
-    description="Production release readiness checklist with sign-off workflow, rollback playbooks, and deployment gates.",
-    version="0.4.0",
+    description=(
+        "Production release readiness checklist with templates, check dependencies, "
+        "sign-off workflow, rollback playbooks, and deployment gates."
+    ),
+    version="0.5.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -41,13 +47,63 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.4.0"}
+    return {"status": "ok", "version": "0.5.0"}
+
+
+# ── Templates ─────────────────────────────────────────────────────────────
+
+@app.post("/templates", response_model=TemplateResponse, status_code=201)
+async def create_tmpl(body: TemplateCreate):
+    if body.from_checklist_id:
+        c = await get_checklist(app.state.db, body.from_checklist_id)
+        if not c:
+            raise HTTPException(404, "Source checklist not found")
+    return await create_template(app.state.db, body.model_dump())
+
+
+@app.get("/templates", response_model=list[TemplateResponse])
+async def list_tmpls():
+    return await list_templates(app.state.db)
+
+
+@app.get("/templates/{template_id}", response_model=TemplateResponse)
+async def get_tmpl(template_id: int):
+    t = await get_template(app.state.db, template_id)
+    if not t:
+        raise HTTPException(404, "Template not found")
+    return t
+
+
+@app.get("/templates/{template_id}/items")
+async def get_tmpl_items(template_id: int):
+    t = await get_template(app.state.db, template_id)
+    if not t:
+        raise HTTPException(404, "Template not found")
+    return await get_template_items(app.state.db, template_id)
+
+
+@app.post("/templates/{template_id}/items", status_code=201)
+async def add_tmpl_item(template_id: int, body: TemplateItemCreate):
+    result = await add_template_item(app.state.db, template_id, body.model_dump())
+    if not result:
+        raise HTTPException(404, "Template not found")
+    return result
+
+
+@app.delete("/templates/{template_id}", status_code=204)
+async def remove_tmpl(template_id: int):
+    if not await delete_template(app.state.db, template_id):
+        raise HTTPException(404, "Template not found")
 
 
 # ── Checklists ────────────────────────────────────────────────────────────
 
 @app.post("/checklists", response_model=ChecklistResponse, status_code=201)
 async def create(body: ChecklistCreate):
+    if body.template_id:
+        t = await get_template(app.state.db, body.template_id)
+        if not t:
+            raise HTTPException(404, "Template not found")
     return await create_checklist(app.state.db, body.model_dump())
 
 
@@ -162,8 +218,10 @@ async def bulk_update(checklist_id: int, body: BulkItemUpdate):
 async def update_item(item_id: int, body: CheckItemUpdate):
     result = await update_check_item(
         app.state.db, item_id, body.status, body.notes, body.checked_by)
-    if not result:
+    if result is None:
         raise HTTPException(404, "Check item not found")
+    if isinstance(result, str):
+        raise HTTPException(422, result)
     return result
 
 
